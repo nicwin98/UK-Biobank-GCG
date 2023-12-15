@@ -1,0 +1,315 @@
+---
+title: "Load df from python"
+output: html_document
+date: "2023-08-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(here)
+library(tidyverse)
+library(MASS) 
+library(reshape2) 
+library(reshape) 
+library(stringr)
+library(doParallel)
+```
+
+Upload datatable that was created in the python script. Rows=genetic variants, cols=individuals.
+```{r}
+df <- fread(here("data-raw/all_genotypes_no_annotation.csv"), header = TRUE, sep="\t", na.strings=c("","NA"))
+df[1:10, 1:10] 
+dim(df)
+
+#remove columns with only NA
+df2 <- as.data.frame(df)
+df2 <- df2[ , colSums(is.na(df2)) < nrow(df2)]
+df2 <- as.data.table(df2)
+
+df2[1:10, 1:10]
+df2$Chrom_pos_ref_alt <- paste0(df2$CHROM, "_", df2$POS, "_", df2$REF, "_", df2$ALT)
+df2 <- relocate(df2, Chrom_pos_ref_alt) 
+df2[, c("CHROM", "POS", "REF", "ALT") := NULL]
+fwrite(df2, here("data/df2.csv"))
+```
+
+## Prepare table for open.cravat
+```{r}
+df_oc <- df[,1:4]
+head(df_oc)
+write.table(df_oc, file = here("data/table_for_opencravat.csv"), row.names = F, quote=F)
+```
+
+### This csv file is uploaded to opencravat.org, and annotations are saved as a .tsv file in the Rproject/data folder. Manually rename to "annotations_open_cravat.tsv"
+```{r}
+oc = fread(here("data/annotations_open_cravat.tsv"), 
+                 header=TRUE, na.strings=c(NA_character_, ""))
+head(oc, n=10)
+```
+
+Merge annotations to main datatable
+
+```{r}
+oc$Chrom_pos_ref_alt <- paste0(oc$Chrom, "_", oc$Pos, "_", oc$Reference_allele, "_", oc$Alternate_allele)
+oc <- relocate(oc, Chrom_pos_ref_alt)
+
+oc2 <- oc[, .(Chrom_pos_ref_alt, Coding, Sequence_Ontology, Exon_Number, Protein_Change, pLoF_M1, pLoF_M2, pLoF_M3, pLoF_M4)] #select columns from oc we want to merge on+include in df2
+
+df2 <- fread(here("data/df2.csv"), na.strings = c(NA_character_, ""))
+
+df3 <- df2[oc2,
+   on = "Chrom_pos_ref_alt"]
+```
+
+Relocate annotation collumns to the front
+```{r}
+df3 <- relocate(df3, c(Coding, Sequence_Ontology, Exon_Number, Protein_Change, pLoF_M1, pLoF_M2, pLoF_M3, pLoF_M4), .after = Chrom_pos_ref_alt)
+colnames(df3)[1:11]
+
+```
+
+
+```{r}
+fwrite(df3, here("data/merge_fullgene_opencravat_nofilter.csv"))
+```
+
+## Filter for quality
+
+# Melt into long format
+If start from here, import file 
+```{r}
+df3 <- fread(here("data/merge_fullgene_opencravat_nofilter.csv"), na.strings=c(NA_character_, ""))
+```
+
+
+First 'melt' into long format, 1 variant per row
+'Protein_Change', 'Coding', 'Sequence_Ontology', 'pLoF_M1', 'pLoF_M2', 'pLoF_M3', 'pLoF_M4', 'genebass_betnovate', 'genebass_nail' are maintained
+'cols' with individuals are made into long format
+Next delete NA values in value (variants not present at level of individual)
+
+Melting takes forever, therefore we run it in parallel
+
+```{r}
+df3[1:5, 1:13] #first individual is col13
+
+
+cols = colnames(df3)[13:ncol(df3)]
+
+```
+
+```{r}
+# set number of CPU cores we want to use
+num_cores <- 12 
+
+# Initialize parallel processing
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+```
+
+```{r}
+# Split  dataset into smaller chunks (1 chunk = 1 row)
+chunks <- split(df3, 1:nrow(df3))
+```
+
+Define a function to melt each chunk
+
+```{r}
+melt_chunk <- function(chunk) {
+    melted_chunk <- data.table::melt(chunk, 
+                    id.vars = c('Chrom_pos_ref_alt', 'Protein_Change', 'Coding', 'Sequence_Ontology'),
+                    measure.vars = cols)
+    melted_chunk <- na.omit(melted_chunk, cols="value")
+    return(melted_chunk)
+}
+
+```
+
+Use parallel processing to melt each chunk
+
+```{r}
+melted_chunks <- foreach(chunk = chunks) %dopar% {
+  melt_chunk(chunk)
+}
+```
+
+```{r}
+# Combine the melted chunks into one final data frame
+final_melted_data <- do.call(rbind, melted_chunks)
+
+# Stop the parallel processing cluster
+stopCluster(cl)
+```
+
+```{r}
+fwrite(final_melted_data, file = here("data/long_format_getotypes_fullgene_nofilter.csv"))
+```
+
+### Filtering
+Rename and relocate  collumns 
+```{r}
+melt_data <- fread(here("data/long_format_getotypes_fullgene_nofilter.csv"))
+head(melt_data)
+```
+
+
+```{r}
+setnames(melt_data, "variable", "eid")
+setnames(melt_data, "value", "Info")
+melt_data <- relocate(melt_data, eid, .before = Chrom_pos_ref_alt)
+colnames(melt_data)
+```
+
+Remove suffix from eid to create eid's that match the UKB dataset
+```{r}
+melt_data$eid <- str_remove(melt_data$eid, "_23141_0_0")
+head(melt_data)
+```
+
+
+Split "info" column into GT:GQ:DP:AD:VAF:PL
+```{r}
+melt_data_filtered <- melt_data[, c("GT", "GQ", "DP", "AD", "VAF", "PL") := tstrsplit(Info, ":", fixed=TRUE)]
+melt_data_filtered[, Info := NULL] #delete original Info column
+```
+
+Make GQ and DP numeric
+```{r}
+melt_data_filtered$GQ <- as.numeric(melt_data_filtered$GQ)
+melt_data_filtered$DP <- as.numeric(melt_data_filtered$DP)
+```
+
+Remove rows with GQ <20 and DP<10
+```{r}
+print(dim(melt_data_filtered))
+melt_data_filtered <- melt_data_filtered[GQ >=20,]
+print(dim(melt_data_filtered))
+melt_data_filtered <- melt_data_filtered[DP >=10,]
+print(dim(melt_data_filtered))
+```
+
+Calculate minor allele balance and remove heterozygots with <0.2
+
+First split AD column by ",". 
+```{r}
+melt_data_filtered <- melt_data_filtered[, c('AD_1', 'AD_2', 'AD_3', 'AD_4') := tstrsplit(AD, ",", fixed=TRUE)]
+melt_data_filtered$AD_2 <- as.numeric(melt_data_filtered$AD_2)
+melt_data_filtered$AB <- melt_data_filtered$AD_2 / melt_data_filtered$DP
+melt_data_filtered <- melt_data_filtered[AB >=0.2,]
+print(dim(melt_data_filtered))
+```
+
+Save this file
+```{r}
+fwrite(melt_data_filtered, file = here("data/long_format_getotypes_fullgene_filtered.csv"))
+```
+
+
+### Keep only coding variants and remove synonymous
+#### Create column variant to describe type of genetic variant.
+0 indicates WT or wildtype-like variant
+
+1 indicates frameshift_mutations including:
+* stop_gained (63)
+* frameshift_elongation (60)
+* frameshift_truncation (124)
+* inframe_deletion (77)
+* inframe_insertion (15)
+* start_lost (1)
+
+2 indicates SNPs/missense variants including:
+* missense_variant (16972)
+
+```{r}
+gt_filtered <- fread(here("data/long_format_getotypes_fullgene_filtered.csv"))
+head(gt_filtered)
+```
+
+```{r}
+
+gt_filtered <- gt_filtered[, variant_type := 0] #NB these will be included in the WT controls
+
+gt_filtered <- 
+ gt_filtered[Sequence_Ontology == "missense_variant",
+    variant_type := 2]
+
+ gt_filtered <-
+     gt_filtered[Sequence_Ontology %in% c(
+     "stop_gained",
+     "frameshift_elongation",
+     "frameshift_truncation",
+     "inframe_deletion",
+     "inframe_insertion",
+     "start_lost"
+ ),
+ variant_type := 1]
+
+ count(gt_filtered, variant_type)
+```
+
+
+```{r}
+#first create Chrom column again
+gt_filtered[, c('Chrom', 'Pos', 'Ref', 'Alt') := tstrsplit(Chrom_pos_ref_alt, "_", fixed=TRUE)]
+
+# Merge Chrom and Protein_Change in one column for all missense variants
+gt_filtered[variant_type == 2, Protein_change := paste0(Chrom, '_', Protein_Change)]
+```
+
+Remove unwanted columns
+```{r}
+gt_filtered <- gt_filtered[, c("Chrom", "Pos", "Ref", "Alt","Protein_Change", "Coding", "Sequence_Ontology", "GQ", "DP", "AD", "VAF", "PL", 
+                               "AD_1", "AD_2", "AD_3", "AD_4", "AB") := NULL]
+```
+
+Create seperate dataframe with APOB variant and remove from this dataset
+```{r}
+df_pos_ctr <- gt_filtered[str_detect(gt_filtered$Chrom_pos_ref_alt, "^chr2")]
+gt_filtered <- gt_filtered[!grepl("^chr2", gt_filtered$Chrom_pos_ref_alt)]
+```
+
+
+Remove prefix chr17_p. for all GCGR variants, but remain on chr2_p. to differentiate
+Change 3 letter code of AA to 1 letter code to easier run original R script
+```{r}
+gt_filtered$Protein_change <- str_remove(gt_filtered$Protein_change, "chr17_p.")
+rep_str <- c('Ala' = 'A',
+            'Arg' = 'R',
+            'Asn' = 'N',
+            'Asp' = 'D',
+            'Cys' = 'C',
+            'Gln' = 'Q',
+            'Glu' = 'E',
+            'Gly' = 'G',
+            'His' = 'H',
+            'Ile' = 'I',
+            'Leu' = 'L',
+            'Lys' = 'K',
+            'Met' = 'M',
+            'Phe' = 'F',
+            'Pro' = 'P',
+            'Pyl' = 'O',
+             'Ser' = 'S',
+            'Sec' = 'U',
+            'Thr' = 'T',
+            'Trp' = 'W',
+            'Tyr' = 'Y',
+            'Val' = 'V')
+gt_filtered$Protein_change <- str_replace_all(gt_filtered$Protein_change, rep_str)
+
+```
+
+
+write csv file filtered for GQ, DP and AB and with 1 letter AA codes
+
+```{r}
+fwrite(gt_filtered, file=here("data/extract_getotypes_fullgene_filtered_varianttype.csv"))
+```
+
+write csv file with only SNPs/missense variants
+```{r}
+SNP <- gt_filtered[variant_type == 2]
+SNP <- SNP[, c("Chrom_pos_ref_alt", "variant_type", "pLoF_M1", "pLoF_M2" , "pLoF_M3", "pLoF_M4", "genebass_betnovate", "genebass_nail") := NULL]
+fwrite(SNP, file=here("data/extract_getotypes_fullgene_SNPs.csv"))
+```
+

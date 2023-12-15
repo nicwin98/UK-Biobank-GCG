@@ -1,0 +1,189 @@
+---
+title: "O-link analyze package"
+author: "MWS"
+date: "2023-09-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(impute)
+library(imputeLCMD)
+```
+
+### 1 Get data
+
+```{r}
+# reading Olink NPX data 
+npx_df <- fread(here("data-raw/olink_proteins_data.csv"))
+npx_df[1:10, 1:10] #instead of head because the df is too big
+dim(npx_df)
+```
+
+```{r}
+# Load gcgr variants dataset
+gcgr_df = fread(here("data-raw/df_gcgr_variants.csv"))
+gcgr_df[1:10, 1:10]
+dim(gcgr_df)
+count(gcgr_df, gcgr)
+```
+
+## 2 Filter data
+
+```{r}
+# Only keep eid, sex, age, BMI, gcgr
+pheno_df <- gcgr_df[,c("eid", "age", "sex", "BMI", "Hba1c", "gcgr")]
+head(pheno_df)
+```
+
+```{r}
+# Keep only rows (=eid) in pheno_df that occur in npx_df
+eid_npx <- npx_df$eid
+pheno_df <- subset(pheno_df, eid %in% eid_npx)
+dim(pheno_df)
+```
+
+```{r}
+# Keep only rows (=eid) in npx_df that occur in pheno_df
+eid_pheno <- pheno_df$eid
+npx_df <- subset(npx_df, eid %in% eid_pheno)
+dim(npx_df)
+
+# save the pheno_df as csv
+write.csv(pheno_df, here("data/pheno_df.csv"), row.names = FALSE)
+```
+
+## 3 Deal with missing data
+```{r}
+# Check if there are there any missing values
+sum(is.na(npx_df))
+
+# how many % are missing
+sum(is.na(npx_df)) / (dim(npx_df)[1]*dim(npx_df)[2]) *100 # 2.9%
+```
+
+### Remove samples and proteins with >10% missingness and impute remaining
+Code available on https://gitfront.io/r/user-2029007/EKPBzX5Fh2KV/UKB-project/blob/03_Protein_prep.R n
+```{r}
+length <- length(rownames(npx_df))
+res <- data.frame(eid = 1:length, Complete = 1:length, Missing = 1:length)
+
+for (i in 1:length){
+  variable <- as.character(npx_df$eid[i])
+  individual <- npx_df[which(npx_df$eid %in% variable),]
+  complete <- table(is.na(individual))
+  index_present <- complete[1]
+  index_missing <- complete[2] 
+  res[i,1] <- variable
+  res[i,2] <-  index_present
+  res[i,3] <- index_missing
+}
+
+# Order by those that have the most missing data 
+res <- res[order(res$Complete),]
+
+# Index how many people have >10% missingness as a proportion 
+res$prop <- res$Missing / 1463
+res$exclude <- ifelse(res$prop > 0.1, '1', '0')
+
+count(res, exclude)
+```
+
+```{r}
+# save misingness summary
+fwrite(res, file=here("data/olink_people_missingness.csv")) 
+```
+
+### Check protein's missingness for the protein measurements
+```{r}
+npx_df <- as.data.frame(npx_df)
+length <- length(colnames(npx_df))
+res2 <- data.frame(Variable = 1:length, Complete = 1:length, Missing = 1:length)
+
+for (i in 1:length){
+  variable <- as.character(colnames(npx_df)[i])
+  complete <- npx_df[which(complete.cases(npx_df[,variable])),]
+  incomplete <- npx_df[-which(complete.cases(npx_df[,variable])),]
+  index_present <- dim(complete)[1]
+  index_missing <- dim(incomplete)[1]
+  res2[i,1] <- variable
+  res2[i,2] <-  index_present
+  res2[i,3] <- index_missing
+}
+
+# Save off missingness summary 
+res2 <- res2[order(res2$Complete),]
+
+# Index how many proteins have >10% missingness
+res2$prop <- res2$Missing / 43462
+res2$exclude <- ifelse(res2$prop > 0.1, '1', '0')
+
+count(res2, exclude)
+
+```
+
+
+```{r}
+# Save out file with exclusion summaries for proteins 
+res2 <- res2[-c(1464:1464),] #remove eid row
+fwrite(res2, here("data/olink_protein_missingness.csv"))
+```
+
+```{r}
+# if start from here:
+res <- read.csv(here("data/olink_people_missingness.csv")) 
+res2 <- read.csv(here("data/olink_protein_missingness.csv"))
+
+# Subset the protein dataset to exclude proteins and individuals with >10% missing data
+
+# Individuals
+indiv_excluded <- res %>%  filter(is.na(exclude) | exclude == "0") # 40164 included
+npx_sub <- npx_df[which(npx_df$eid %in% indiv_excluded$eid),]
+
+# Proteins
+npx_sub <- as.data.frame(npx_sub)
+IDs <- npx_sub[1]
+proteins_excluded <- res2 %>% filter(exclude != "1") # 1459 included
+npx_sub2 <- npx_sub[, which(names(npx_sub) %in% proteins_excluded$Variable)]
+npx_sub2 <- cbind(IDs, npx_sub2)
+# Proteins: from 1463 - 1459 = 4 excluded
+# individuals: from 43462 to 40164 = 3298 excluded
+
+sum(is.na(npx_sub2)) # 634707/1824534 originally missing = 2/3 NAs removed, 1/3 left
+sum(is.na(npx_sub2)) / (dim(npx_sub2)[1]*dim(npx_sub2)[2]) *100 # 1.1% missing data
+```
+
+### MinProb imputation 
+
+```{r}
+eids <- npx_sub2[1]
+npx_data <- npx_sub2[-1]
+npx_data <- as.matrix(npx_data)
+rownames(npx_data) <- eids$eid
+npx_data <- t(npx_data)
+
+## MinProb
+
+imputed <- impute.MinProb(npx_data, q = 0.01)
+
+imputed_data <- as.data.frame(t(imputed))
+ 
+identical(as.character(rownames(imputed_data)), as.character(eids$eid)) # just checking
+ 
+imputed_data <- cbind(eids, imputed_data)
+
+```
+
+```{r}
+# Save imputed data as csv
+fwrite(imputed_data, file = here("data/olink_10%missing_MinProb_imputed.csv"))
+```
+
+
+
+

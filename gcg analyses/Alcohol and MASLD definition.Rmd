@@ -1,0 +1,141 @@
+---
+title: "alcohol and MASLD"
+author: "MWS"
+date: "2023-10-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(tidyverse)
+library(data.table)
+source(here("R/functions.R"))
+```
+
+# Import data
+```{r}
+df <- fread(here("data-raw/ukb_all_datasets.csv"))
+```
+
+#Alcohol intake
+```{r}
+#Set prefer not to answer and do not know (-1 and -3) to NA
+df$average_weekly_beer_plus_cider_intake_f1588_0_0[df$average_weekly_beer_plus_cider_intake_f1588_0_0<0] <- NA
+df$average_weekly_champagne_plus_white_wine_intake_f1578_0_0[df$average_weekly_champagne_plus_white_wine_intake_f1578_0_0<0] <- NA
+df$average_weekly_fortified_wine_intake_f1608_0_0[df$average_weekly_fortified_wine_intake_f1608_0_0<0] <- NA
+df$average_weekly_intake_of_other_alcoholic_drinks_f5364_0_0[df$average_weekly_intake_of_other_alcoholic_drinks_f5364_0_0<0] <- NA
+df$average_weekly_red_wine_intake_f1568_0_0[df$average_weekly_red_wine_intake_f1568_0_0<0] <- NA
+df$average_weekly_spirits_intake_f1598_0_0[df$average_weekly_spirits_intake_f1598_0_0<0] <- NA
+
+# units of alcohol i beverages based on: https://www.nhs.uk/live-well/alcohol-advice/calculating-alcohol-units/
+
+# weekly units of alcohol - redwine (f1568), 1 glass = 2.1 units
+df$average_weekly_red_wine_intake_f1568_0_0 <- df$average_weekly_red_wine_intake_f1568_0_0 * 2.1
+# weekly units of alcohol - champagne etc (f1578), 1 glass = 2.1 units
+df$average_weekly_champagne_plus_white_wine_intake_f1578_0_0 <- df$average_weekly_champagne_plus_white_wine_intake_f1578_0_0 * 2.1
+# weekly units of alcohol - beer and cider (f1588), 1 pint = 2 units
+df$average_weekly_beer_plus_cider_intake_f1588_0_0 <- df$average_weekly_beer_plus_cider_intake_f1588_0_0 * 2
+# weekly units of alcohol - spirits (f1598), 1 measure = 1 unit (no calculation needed)
+# weekly units of alcohol - fortified wine (f1608), 1 measure = 1 unit (no calculation needed)
+# weekly units of other alcoholic drinks incl alcopops, 1 glass = 1.5 units
+df$average_weekly_intake_of_other_alcoholic_drinks_f5364_0_0 <- df$average_weekly_intake_of_other_alcoholic_drinks_f5364_0_0 * 1.5
+
+#Calculate the sum of weekly units alcoholic intake
+df <- df %>%
+    rowwise() %>%
+    mutate(weekly_alcohol = sum(average_weekly_beer_plus_cider_intake_f1588_0_0,
+    average_weekly_champagne_plus_white_wine_intake_f1578_0_0,
+    average_weekly_fortified_wine_intake_f1608_0_0,
+    average_weekly_intake_of_other_alcoholic_drinks_f5364_0_0,
+    average_weekly_red_wine_intake_f1568_0_0,
+    average_weekly_spirits_intake_f1598_0_0,
+    na.rm=T))
+
+```
+
+
+## NAFLD incl.icd10
+```{r}
+# set df to data.table for function to work
+setDT(df)
+
+#NAFLD
+df <- find_ICD10_filter(df, "K760", "NAFLD")
+
+count(df, NAFLD)
+
+# Number of PDFF measures in dataset 40534 
+count(df, !is.na(proton_density_fat_fraction_pdff_f40061_2_0))
+
+
+# Add pdff>5.5 for women and men based on alcohol intake (NAFLD when drinking less than 140 g alcohol per week for women and less than 210 g alcohol per week for men (EASL guideline 2016). 1 unit = 8 g alcohol => NAFLD when less than < 17.5 units alcohol/week for women and 26.25 units alcohol/week for men
+df$NAFLD[df$proton_density_fat_fraction_pdff_f40061_2_0 > 5.5 &
+                 df$sex_f31_0_0 == "Female" &
+                 df$weekly_alcohol < 17.5] <- 1
+df$NAFLD[df$proton_density_fat_fraction_pdff_f40061_2_0 > 5.5 &
+                 df$sex_f31_0_0 == "Male" &
+                 df$weekly_alcohol<26.25] <- 1
+
+# Remove alcoholic liver disease from control group (set to NA)
+df$NAFLD[df$proton_density_fat_fraction_pdff_f40061_2_0 > 5.5 &
+                 df$sex_f31_0_0 == "Female" &
+                 df$weekly_alcohol > 17.5] <- NA
+df$NAFLD[df$proton_density_fat_fraction_pdff_f40061_2_0 > 5.5 &
+                 df$sex_f31_0_0 == "Male" &
+                 df$weekly_alcohol > 26.25] <- NA
+
+df %>%
+    count(NAFLD) # 12052
+```
+
+
+## NAFLD excl. icd10
+```{r}
+# Create column of 0's for individuals with PDFF available
+df$NAFLD_bs[!is.na(df$proton_density_fat_fraction_pdff_f40061_2_0)] <- 0
+
+# Add pdff>5.5 for women and men based on alcohol intake (NAFLD when drinking less than 140 g alcohol per week for women and less than 210 g alcohol per week for men (EASL guideline 2016). 1 unit = 8 g alcohol => NAFLD when less than < 17.5 units alcohol/week for women and 26.25 units alcohol/week for men
+df$NAFLD_bs[df$proton_density_fat_fraction_pdff_f40061_2_0 > 5.5 &
+                 df$sex_f31_0_0 == "Female" &
+                 df$weekly_alcohol < 17.5] <- 1
+df$NAFLD_bs[df$proton_density_fat_fraction_pdff_f40061_2_0 > 5.5 &
+                 df$sex_f31_0_0 == "Male" &
+                 df$weekly_alcohol<26.25] <- 1
+
+# Remove alcoholic liver disease from control group (set to NA)
+df$NAFLD_bs[df$proton_density_fat_fraction_pdff_f40061_2_0 > 5.5 &
+                 df$sex_f31_0_0 == "Female" &
+                 df$weekly_alcohol > 17.5] <- NA
+df$NAFLD_bs[df$proton_density_fat_fraction_pdff_f40061_2_0 > 5.5 &
+                 df$sex_f31_0_0 == "Male" &
+                 df$weekly_alcohol > 26.25] <- NA
+
+df %>%
+    count(NAFLD_bs) # 6614
+```
+
+## "Alcoholic"
+```{r}
+# Create column "alcoholic". When PDFF is treated as a continous variable, these individuals should be excluded
+# Women: >17.5 --> 1
+# Men > 26.35 --> 1
+
+setDT(df)
+
+df[, alcoholic := 0]
+df[sex_f31_0_0 == "Female" & weekly_alcohol > 17.5, alcoholic := 1]
+df[sex_f31_0_0 == "Male" & weekly_alcohol > 26.25, alcoholic := 1]
+count(df, alcoholic, NAFLD, NAFLD_bs)
+```
+
+
+write CSV with baseline MASLD and alcohol intake
+```{r}
+setnames(df, "NAFLD", "MASLD")
+setnames(df, "NAFLD_bs", "MASLD_bs")
+df_MASLD <- df[, c("eid", "MASLD", "MASLD_bs", "alcoholic")]
+head(df_MASLD)
+fwrite(df_MASLD, file = here("data/baseline_MASLD.csv"))
+```
+

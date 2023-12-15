@@ -1,0 +1,195 @@
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(here)
+library(limma)
+library(tidyverse)
+library(ggrepel)
+library(openxlsx)
+library(biomaRt)
+```
+
+## 1. Load data
+```{r}
+# Read olink protein expression dataframe
+npx_df <- fread(here("data/olink_10%missing_MinProb_imputed.csv"))
+npx_df <- data.frame(npx_df, row.names = "eid")
+
+# Read the phenotype dataframe
+pheno_df <- fread(here("data/pheno_df.csv"), na.strings=c("","NA"))
+```
+
+
+```{r}
+colnames(npx_df)[1:5]
+dim(npx_df)
+npx_df[1:5, 1:10]
+```
+
+```{r}
+colnames(pheno_df)
+dim(pheno_df)
+head(pheno_df)
+```
+
+```{r}
+count(pheno_df, gcgr)
+
+# move G40S homozygot (n=1) to the 0/1 group
+pheno_df[gcgr == "G40S 1/1", gcgr := "G40S 0/1"]
+```
+
+## 2. Select type of gcgr variants to be compared to wt
+
+```{r}
+pheno_gcgr <- subset(pheno_df, gcgr %in% c("WT", "truncated", "cAMP_LoF 0/1", "G40S 0/1"))
+npx_gcgr <- subset(npx_df, row.names(npx_df) %in% pheno_gcgr$eid)
+```
+
+## 3. Run Limma
+### Truncated vs. WT
+```{r}
+# Sort counts by sample order in phenotype_df
+npx_gcgr <- npx_gcgr[match(pheno_gcgr$eid, rownames(npx_gcgr)), ]
+identical(rownames(npx_gcgr), as.character(pheno_gcgr$eid)) #just checking
+```
+
+```{r}
+# Specify sample condition (truncated vs WT)
+outcome <- factor(pheno_gcgr$gcgr)
+age <- as.numeric(pheno_gcgr$age)
+sex <- factor(pheno_gcgr$sex)
+```
+
+```{r}
+design <- model.matrix(~0 + outcome + age + sex, pheno_gcgr)
+colnames(design)[1:2] <- c("outcomecAMP_LoF", "outcomeG40S")
+head(design)
+```
+
+```{r}
+# lmFit expects input array to have structure: protein x sample
+# lmFit fits a linear model using weighted least squares for each protein:
+fit <- lmFit(t(npx_gcgr), design)
+head(coef(fit))
+```
+
+```{r}
+# Comparisons between groups (log fold-changes) are obtained as contrasts of
+# these fitted linear models:
+# Samples are grouped based on experimental condition
+# The variability of protein expression is compared between these groups
+contr <- makeContrasts(outcometruncated-outcomeWT,
+                       outcomeG40S-outcomeWT,
+                       outcomecAMP_LoF-outcomeWT,
+                       levels = design)
+contr
+```
+
+```{r}
+# Estimate contrast for each protein
+tmp <- contrasts.fit(fit, contr)
+```
+
+```{r}
+# Empirical Bayes smoothing of standard errors (shrinks standard errors
+# that are much larger or smaller than those from other proteins towards the average standard error)
+tmp <- eBayes(tmp)
+#tmp
+```
+
+```{r}
+# Extract results
+top.table.trunc <- topTable(tmp, coef = 1, sort.by = "P", n = Inf) #default is "BH" which is alias of "fdr"
+results.trunc <-  as.data.frame(top.table.trunc)
+results.trunc$protein <- row.names(results.trunc)
+fwrite(results.trunc, file = here("data/Diff.Prot.Expr.Truncated_vs_WT.csv"))
+
+top.table.G40S <- topTable(tmp, coef=2, sort.by = "P", n = Inf)
+results.G40S <-  as.data.frame(top.table.G40S)
+results.G40S$protein <- row.names(results.G40S)
+fwrite(results.G40S, file = here("data/Diff.Prot.Expr.G40S_hetrozygot_vs_WT.csv")) 
+###includes 1 homozygot as well
+
+top.table.cAMP <- topTable(tmp, coef=3, sort.by = "P", n = Inf)
+results.cAMP <-  as.data.frame(top.table.cAMP)
+results.cAMP$protein <- row.names(results.cAMP)
+fwrite(results.cAMP, file = here("data/Diff.Prot.Expr.cAMP_LoF_vs_WT.csv"))
+```
+
+## 4. Plot results
+```{r}
+results.trunc <- fread(here("data/Diff.Prot.Expr.Truncated_vs_WT.csv"))
+results.G40S <- fread(here("data/Diff.Prot.Expr.G40S_hetrozygot_vs_WT.csv"))
+results.cAMP <- fread(here("data/Diff.Prot.Expr.cAMP_LoF_vs_WT.csv"))
+```
+
+
+Create plot - truncated
+```{r}
+volcano_plot <- ggplot(results.trunc) +
+    geom_point(aes(x = logFC, y = -log10(P.Value), color = ifelse(protein == 'gcg', 'blue', ifelse(adj.P.Val < 0.1, 'red', 'grey')))) +
+    scale_color_identity() +
+    labs(x = "log2 fold change", y = "-log10 p-value") +
+    ggtitle("Differential Protein Expression, Volcano Plot, Truncated variants vs. WT") +
+    geom_label_repel(data = head(results.trunc[results.trunc$protein == 'gcg', ], 1), 
+                     aes(x = logFC, y = -log10(P.Value), label = protein), 
+                                      color = 'blue') +
+    geom_label_repel(data = head(results.trunc[adj.P.Val < 0.1, ], 10), 
+                     aes(x = logFC, y = -log10(P.Value), label = protein), 
+                                         color = 'red')
+
+volcano_plot
+
+```
+
+
+
+Create plot - G40S
+```{r}
+volcano_plot <- ggplot(results.G40S) +
+    geom_point(aes(x = logFC, y = -log10(P.Value), color = ifelse(protein == 'gcg', 'blue', ifelse(adj.P.Val < 0.1, 'red', 'grey')))) +
+    scale_color_identity() +
+    labs(x = "log2 fold change", y = "-log10 p-value") +
+    ggtitle("Differential Protein Expression, Volcano Plot, G40S vs. WT") +
+    geom_label_repel(data = head(results.G40S[results.G40S$protein == 'gcg', ], 1), 
+                     aes(x = logFC, y = -log10(P.Value), label = protein), 
+                                      color = 'blue') +
+    geom_label_repel(data = head(results.G40S[adj.P.Val < 0.1, ], 10), 
+                     aes(x = logFC, y = -log10(P.Value), label = protein), 
+                                         color = 'red')
+
+volcano_plot
+
+```
+
+Create plot - cAMP_LoF
+```{r}
+volcano_plot <- ggplot(results.cAMP) +
+    geom_point(aes(x = logFC, y = -log10(P.Value), color = ifelse(protein == 'gcg', 'blue', ifelse(adj.P.Val < 0.1, 'red', 'grey')))) +
+    scale_color_identity() +
+    labs(x = "log2 fold change", y = "-log10 p-value") +
+    ggtitle("Differential Protein Expression, Volcano Plot, cAMP vs. WT") +
+    geom_label_repel(data = head(results.cAMP[results.cAMP$protein == 'gcg', ], 1), 
+                     aes(x = logFC, y = -log10(P.Value), label = protein), 
+                                      color = 'blue') +
+    geom_label_repel(data = head(results.cAMP[adj.P.Val < 0.1, ], 10), 
+                     aes(x = logFC, y = -log10(P.Value), label = protein), 
+                                         color = 'red')
+
+volcano_plot
+
+```
+
+## 5. Tables of top 10 up and down regulated + add GO terms
+```{r}
+results.trunc <- fread(here("data/Diff.Prot.Expr.Truncated_vs_WT.csv"))
+results.G40S <- fread(here("data/Diff.Prot.Expr.G40S_hetrozygot_vs_WT.csv"))
+results.cAMP <- fread(here("data/Diff.Prot.Expr.cAMP_LoF_vs_WT.csv"))
+
+# Convert protein names to uppercase
+results.trunc$protein <- toupper(results.trunc$protein)
+results.G40S$protein <- toupper(results.G40S$protein)
+results.cAMP$protein <- toupper(results.cAMP$protein)
+```

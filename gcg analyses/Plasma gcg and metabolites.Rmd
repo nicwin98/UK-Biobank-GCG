@@ -1,0 +1,532 @@
+---
+title: "Plasma gcg"
+author: "MWS"
+date: "2023-10-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(here)
+library(limma)
+library(tidyverse)
+library(ggrepel)
+library(kableExtra)
+library(knitr)
+library(ggpubr)
+library(rstatix)
+library(gridExtra)
+```
+
+## 1. Load data
+```{r}
+# Read olink protein expression dataframe
+
+npx_df <- fread(here("data/olink_10%missing_MinProb_imputed.csv")) # 10% missing samples and proteins were removed before minProb imputation
+
+```
+
+
+```{r}
+gcg <- npx_df[, c("eid", "gcg")]
+
+# Read the phenotype dataframe
+pheno_df = fread(here("data-raw/df_gcgr_variants.csv"))
+
+# Remove withdrawals
+withdrawals <- fread(here("data-raw/xxxx.txt"))
+pheno_df <- pheno_df[!pheno_df$eid %in% withdrawals$V1,]
+
+# Read baseline MASLD dataframe
+MASLD_df <- fread(here("data/baseline_MASLD.csv"))
+
+pheno_df <- merge(pheno_df, MASLD_df, by = "eid")
+
+```
+
+## 2. Merge data
+```{r}
+df <- merge(gcg, pheno_df, by = "eid")
+
+# include G40S homozygot in the hetrozygot group
+df[G40S == 2, G40S := 1]
+
+# Make MASLD_bs factor with yes/no
+df$MASLD_bs <- factor(df$MASLD_bs, levels = c(0,1), labels = c("No", "Yes")) #MASLD: ICD10+PDFF+alcohol, MASLD_bs: PDFF+alcohol
+```
+
+```{r}
+# rename T1D and T2D
+setnames(df, "adj_probposs_t1dm", "Type1Diabetes")
+setnames(df, "adj_probposs_t2dm", "Type2Diabetes")
+
+# Make sure T1D and gestational are removed from controls in T2D
+df$adj_dmstatus_bl <- as.numeric(df$adj_dmstatus_bl)
+df$adj_dmstatus_bl <-
+    factor(df$adj_dmstatus_bl,
+        levels = c(0,1,2,3,4,5),
+        labels = c(
+            "unlikely_diabetes",
+            "poss_gestational",
+            "prob_t1d",
+            "poss_t1d",
+            "prob_t2d",
+            "poss_t2d"))
+df[adj_dmstatus_bl == "poss_gestational" |
+       adj_dmstatus_bl == "prob_t1d" |
+       adj_dmstatus_bl == "poss_t1d",
+   Type2Diabetes := NA] 
+
+df[adj_dmstatus_bl == "poss_gestational" |
+       adj_dmstatus_bl == "prob_t2d" |
+       adj_dmstatus_bl == "poss_t2d",
+   Type1Diabetes := NA]
+
+count(df, adj_dmstatus_bl, Type2Diabetes, Type1Diabetes)
+
+df$T2D <- factor(df$Type2Diabetes, levels = c(0,1), labels = c("No", "Yes"))
+```
+
+## 3. Gcg-alanine index
+Calculate index
+```{r}
+df$index <- df$gcg*df$alanine
+```
+
+Index - PDFF in xy plot
+```{r}
+# Remove "alcoholics" from percent_liver_fat column
+df$percent_liver_fat <- df$PDFF
+df[alcoholic == 1, percent_liver_fat := NA]
+
+# Create dataset without missing data on index and PDFF
+df_index_PDFF <- df %>% filter(!is.na(index), !is.na(percent_liver_fat)) 
+
+# Make col with log-transformed liver fat
+df_index_PDFF$log_liverfat <- log(df_index_PDFF$percent_liver_fat)
+
+# Create a scatter plot with a correlation line
+plot <- ggplot(df_index_PDFF, aes(x = log_liverfat, y = index)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(title = "XY Plot of percent liver fat vs. gcg-alanine index",
+       x = "Log(Percent Liver Fat)",
+       y = "Gcg - alanine index") +
+  theme_minimal()
+
+# Get correlation statistics
+cor_test_result <- cor.test(df_index_PDFF$log_liverfat, df_index_PDFF$index)
+
+# Extract information for annotation
+correlation_coef <- cor_test_result$estimate
+p_value <- round(cor_test_result$p.value, digits = 12)
+sample_size <- nrow(df_index_PDFF)
+
+# Add annotations to the plot
+plot_annotation <- plot +
+  annotate("text", x = Inf, y = -Inf, hjust = 1, vjust = -8,
+           label = paste("r:", round(correlation_coef, 3))) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1, vjust = -6,
+           label = paste("P-value:", p_value)) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1, vjust = -4,
+           label = paste("Sample Size:", sample_size))
+
+plot_annotation
+
+```
+
+ Index in linear model
+```{r}
+## Normalize covariates
+# Glucose : SD
+sd_glucose <- sd(df_index_PDFF$glucose, na.rm = TRUE)
+df_index_PDFF$glucose_SD <- df_index_PDFF$glucose/sd_glucose
+
+# BMI : 5
+df_index_PDFF$BMI_5 <- df_index_PDFF$BMI/5
+
+# PDFF : 5
+df_index_PDFF$percent_liver_fat_5 <- df_index_PDFF$percent_liver_fat/5
+
+# age : 5
+df_index_PDFF$age_5 <- df_index_PDFF$age/5
+
+model <- lm(index ~ percent_liver_fat_5 + BMI_5 + glucose_SD + fasting_time + sex + age_5, data = df_index_PDFF)
+
+  # Extract coefficients and their standard errors
+  coef_summary <- summary(model)$coefficients
+  
+  # Calculate sample size
+    sample_size <- nrow(df_index_PDFF)
+
+    # Coef_table
+    coef_table <- data.frame(
+        variable = rownames(coef_summary)[-1],
+        estimate = coef_summary[-1, "Estimate"],
+        SE = coef_summary[-1, "Std. Error"],
+        p = coef_summary[-1, "Pr(>|t|)"]    
+        )
+    
+# rename the variables
+replace_values <- c("sex" = "sex (male)",
+                    "age_5" = "age \n (5y increase)",# \n is to split in two lines in the plot
+                    "fasting_time" = "fasting time (h)",
+                    "percent_liver_fat_5" = "% liver fat (5% increase)",
+                    "BMI_5" = "BMI (5 unit increase)",
+                    "glucose_SD" = "glucose (SD units)")
+coef_table <- coef_table %>%  mutate(variable = ifelse(variable %in% names(replace_values), replace_values[variable], variable))
+
+# Forest plot
+p.index <- ggplot(coef_table, aes(x = estimate, xmin = estimate - 1.96 * SE, xmax = estimate + 1.96 * SE, y = reorder(variable, estimate))) +
+    geom_point(size = 3) +
+    geom_errorbarh(height = 0) +
+    ggtitle(" ") + #otherwise the height of the figure does not match the tables
+    scale_x_continuous() +
+    labs(x = paste("Change in gcg-alanine index per increment \n n =", sample_size), y = "") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") + # Add a dashed line at x = 0
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_text(size = 12),
+          axis.text.x = element_text(size = 12))
+    p.index
+```
+ 
+
+## 4. Linear models of confounders  
+
+Covariates
+```{r}
+# "normalise" to a biological relevant effect size
+
+# age -> 5 year increase
+df$age_5 <- df$age/5
+
+# plasma creatinine
+df$pCreatinine_5 <- df$pCreatinine/5
+head(df$pCreatinine_5)
+
+```
+
+Create coefficient table
+```{r}
+# string of variables to loop through
+covariables <- c("age_5", "sex", "pCreatinine_5")
+
+coef_table_covariates <- data.frame()  # Create an empty data frame to store coefficients
+
+for (i in covariables) {
+  formula_string <- paste("gcg ~", i)
+  model <- lm(formula_string, data = df)
+  
+  # Extract coefficients and their standard errors
+  coef_summary <- summary(model)$coefficients
+  
+  # Calculate sample size
+    sample_size_i <- sum(!is.na(df[[i]]))
+ 
+  # Create a data frame with the p.values for each of the predictors
+  coef_data <- data.frame(
+    variable = i,
+    sample_size = sample_size_i,
+    estimate = coef_summary[i, "Estimate"],
+    estimate_std_err = coef_summary[i, "Std. Error"], 
+    P.value_variable = coef_summary[i, "Pr(>|t|)"])
+  
+    # Append the data frame to the coefficients table
+  coef_table_covariates <- rbind(coef_table_covariates, coef_data)
+}
+
+# Add FDR adjusted p-val for the variable
+coef_table_covariates$Adj.P.value_variable <- p.adjust(coef_table_covariates$P.value_variable, method = "fdr")
+coef_table_covariates <- relocate(coef_table_covariates, Adj.P.value_variable, .after = "P.value_variable")
+
+# format p-values
+# Define a threshold for significance
+threshold <- 2e-16
+
+# Format the p-value
+p_val_cols <- colnames(coef_table_covariates)[5:ncol(coef_table_covariates)]
+for (i in p_val_cols) {
+  coef_table_covariates[[i]] <-   ifelse(coef_table_covariates[[i]] < threshold, paste("<", threshold), 
+                                              sprintf("%.2e", coef_table_covariates[[i]]))
+}
+
+# rename the variables
+replace_values <- c("sex" = "sex (male)",
+                    "age_5" = "age \n (5y increase)",# \n is to split in two lines in the plot
+                    "pCreatinine_5" = "creatinine \n (5 mmol/L increase)", # \n is to split in two lines in the plot
+                    "fasting_time" = "fasting time (h)")
+coef_table_covariates <- coef_table_covariates %>%  mutate(variable = ifelse(variable %in% names(replace_values), replace_values[variable], variable))
+
+```
+
+Create plot + tables
+```{r}
+# Create the forest plot
+  p.confound <- ggplot(coef_table_covariates, aes(x = estimate, xmin = estimate - 1.96 * estimate_std_err, xmax = estimate + 1.96 * estimate_std_err, y = reorder(variable, estimate))) +
+    geom_point(size = 3) +
+    geom_errorbarh(height = 0) +
+    ggtitle(" ") + #otherwise the height of the figure does not match the tables
+    scale_x_continuous() +
+    labs(x = "Change in gcg (npx) per increment", y = "") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") + # Add a dashed line at x = 0
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_text(size = 15),
+          axis.text.x = element_text(size = 15))
+
+  # Create the first table
+  t1.confound <- ggplot(data = coef_table_covariates) +
+    geom_text(aes(y = reorder(variable, estimate), x = 1, label = paste0(round(estimate, digits = 2))), vjust = 0, size = 5) +
+    ggtitle(expression(beta)) +
+    xlab(" ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 15, hjust = 0.5)
+    )
+
+  # Create the second table
+  t2.confound <- ggplot(data = coef_table_covariates) +
+    geom_text(aes(y = reorder(variable, estimate), x = 1, label = paste0("(", round(estimate - 1.96 * estimate_std_err, digits = 2), "; ", round(estimate + 1.96 * estimate_std_err, digits = 2), ")")), vjust = 0, size = 5) + # the size = size of numbers in the table
+    ggtitle("95% CI") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 15, hjust = 0.5)
+    )
+
+  # Create the third table
+  t3.confound <- ggplot(data = coef_table_covariates) +
+    geom_text(aes(y = reorder(variable, estimate), x = 1, label = Adj.P.value_variable), vjust = 0, size = 5) +
+    ggtitle("p-value") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 15, hjust = 0.5)
+    )
+  
+   # Create the fourth table
+  t4.confound <- ggplot(data = coef_table_covariates) +
+    geom_text(aes(y = reorder(variable, estimate), x = 1, label = sample_size), vjust = 0, size = 5) +
+    ggtitle("N") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 15, hjust = 0.5)
+    )
+
+  # Arrange the plots and tables using grid.arrange
+  combined_plot.confounders <- grid.arrange(p.confound, t1.confound, t2.confound, t3.confound, t4.confound, widths = c(12, 2, 3, 3, 2))
+```
+
+
+## 5. Linear models of circulating metabolites
+
+Normalize to SD
+```{r}
+# string of variables to loop through
+variables <- c("alanine", "glutamine", "glycine", "histidine", "isoleucine", "leucine", "valine", "phenylalanine", "tyrosine", "Hba1c", "glucose")
+
+setDT(df)
+
+# Calculate SD's
+sd_values <- df[, lapply(.SD, sd, na.rm=TRUE), .SDcols = variables]
+
+# Loop through the variables and create new columns
+for(variable in variables) {
+  new_column_name <- paste0(variable, "_SD")
+  df[, (new_column_name) := .SD[[variable]] / sd_values[[variable]]]
+}
+```
+
+```{r create coef table AA+glucose}
+# string of variables to loop through
+variables <- c("alanine_SD", "glutamine_SD", "glycine_SD", "histidine_SD", "isoleucine_SD", "leucine_SD", "valine_SD", "phenylalanine_SD", "tyrosine_SD", "Hba1c_SD", "glucose_SD")
+
+coef_table_gcg_metab <- data.frame()  # Create an empty data frame to store coefficients
+df <- as.data.frame(df)
+
+for (i in variables) {
+   # Create a subset of the data frame with the necessary columns
+  df_subset <- df[, c("gcg", i, "age", "sex", "BMI", "fasting_time", "pCreatinine")]
+  
+  # Exclude rows with missing data in any of the specified variables
+  df_subset <- na.omit(df_subset)
+  
+  # Count the number of individuals included in the models after removing missing data
+  n_individuals_i <- nrow(df_subset)
+  
+  # create model
+  formula_string <- paste("gcg ~", i, "+age+sex+BMI+Type2Diabetes+fasting_time+pCreatinine")
+  model <- lm(formula_string, data = df, na.action = na.omit)
+  
+  # Extract coefficients and their standard errors
+  coef_summary <- summary(model)$coefficients
+  
+  # Create a data frame with the p.values for each of the predictors
+  coef_data <- data.frame(
+    variable = i,
+    sample_size = n_individuals_i,
+    estimate = coef_summary[i, "Estimate"],
+    estimate_std_err = coef_summary[i, "Std. Error"], 
+    P.value_variable = coef_summary[i, "Pr(>|t|)"],
+    P.value_BMI = coef_summary["BMI", "Pr(>|t|)"],
+    P.value_sex = coef_summary["sex", "Pr(>|t|)"],
+    P.value_age = coef_summary["age", "Pr(>|t|)"],
+    P.value_fasting_time = coef_summary["fasting_time", "Pr(>|t|)"],
+    P.value_creatinine = coef_summary["pCreatinine", "Pr(>|t|)"])
+  
+    # Append the data frame to the coefficients table
+  coef_table_gcg_metab <- rbind(coef_table_gcg_metab, coef_data)
+}
+
+# Add FDR adjusted p-val for the variable
+coef_table_gcg_metab$Adj.P.value_variable <- p.adjust(coef_table_gcg_metab$P.value_variable, method = "fdr")
+coef_table_gcg_metab <- relocate(coef_table_gcg_metab, Adj.P.value_variable, .after = "P.value_variable")
+
+# format p-values
+# Define a threshold for significance
+threshold <- 2e-16
+
+# Format the p-value
+p_val_cols <- colnames(coef_table_gcg_metab)[5:ncol(coef_table_gcg_metab)]
+for (i in p_val_cols) {
+  coef_table_gcg_metab[[i]] <-   ifelse(coef_table_gcg_metab[[i]] < threshold, paste("<", threshold), 
+                                              sprintf("%.2e", coef_table_gcg_metab[[i]]))
+}
+
+# Remove the "_SD" suffix on the variables
+  coef_table_gcg_metab$variable <- sub("_SD$", "", coef_table_gcg_metab$variable)
+
+  # rename sumAA to total AA
+  #coef_table_gcg_metab$variable[coef_table_gcg_metab$variable == 'sumAA'] <- 'total AA'
+  
+# Add Subheader column
+coef_table_gcg_metab$subheader[coef_table_gcg_metab$variable %in% c("leucine", "isoleucine", "valine")] <- "BCAA"
+coef_table_gcg_metab$subheader[coef_table_gcg_metab$variable %in% c("alanine", "glutamine", "glycine", "histidine", "phenylalanine", "tyrosine")] <- "Amino acids"
+coef_table_gcg_metab$subheader[coef_table_gcg_metab$variable %in% c("glucose", "Hba1c")] <- "Glucose \n homeostasis"
+
+```
+
+Forest plot + tables
+```{r plot}
+# Convert 'subheader' to a factor
+coef_table_gcg_metab$subheader <- factor(coef_table_gcg_metab$subheader, levels = c("Amino acids", "BCAA", "Glucose \n homeostasis"))
+
+   # Create the forest plot
+  p <- ggplot(coef_table_gcg_metab, aes(x = estimate, xmin = estimate - 1.96 * estimate_std_err, xmax = estimate + 1.96 * estimate_std_err, y = reorder(variable, estimate))) +
+  geom_point(size = 3) +
+  geom_errorbarh(height = 0) +
+  ggtitle(" ") + # otherwise the height of the figure does not match the tables
+  scale_x_continuous() +
+  labs(x = "Change in gcg (npx) per metabolite SD", y = "") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") + # Add a dashed line at x = 0
+  theme_classic() +
+  theme(legend.position = "none",
+        strip.placement = "outside",  # Place the strip labels outside the plot
+        strip.background = element_blank(),  # Remove strip background
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        strip.text.y.left = element_text(face = "bold", angle = 0, size = 11)) +  # Set angle to 0 for horizontal text
+  facet_grid(subheader ~ ., scales = "free", space = "free", switch = "y") +
+  theme(plot.margin = margin(l = 30))  # Adjust left margin to create space for strip labels
+
+  # Specify order of metabolites for plot. group by subheader, order by estimate (this is done by the facet_grid in the forest plot)
+coef_table_gcg_metab <- coef_table_gcg_metab %>%
+  arrange(subheader, desc(estimate)) %>%
+  mutate(variable = factor(variable, levels = unique(variable)))
+  
+# Create the first table
+  t1 <- ggplot(data = coef_table_gcg_metab) +
+    geom_text(aes(y = rev(variable), x = 1, label = paste0(round(estimate, digits = 2))), vjust = 0) +
+    ggtitle(expression(beta)) +
+    xlab(" ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+  # Create the second table
+  t2 <- ggplot(data = coef_table_gcg_metab) +
+    geom_text(aes(y = rev(variable), x = 1, label = paste0("(", round(estimate - 1.96 * estimate_std_err, digits = 2), "; ", round(estimate + 1.96 * estimate_std_err, digits = 2), ")")), vjust = 0) +
+    ggtitle("95% CI") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+  # Create the third table
+  t3 <- ggplot(data = coef_table_gcg_metab) +
+    geom_text(aes(y = rev(variable), x = 1, label = Adj.P.value_variable), vjust = 0) +
+    ggtitle("p-value") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+  
+   # Create the fourth table
+  t4 <- ggplot(data = coef_table_gcg_metab) +
+    geom_text(aes(y = rev(variable), x = 1, label = sample_size), vjust = 0) +
+    ggtitle("N") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+  # Arrange the plots and tables using grid.arrange
+  combined_plot <- grid.arrange(p, t1, t2, t3, t4, widths = c(12, 2, 3, 3, 2))
+
+  
+```
+
+

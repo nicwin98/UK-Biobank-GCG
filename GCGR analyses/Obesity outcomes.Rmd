@@ -1,0 +1,572 @@
+---
+title: "obesity/NAFLD"
+author: "MWS"
+date: "2023-09-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(MatchIt)
+library(here)
+library(epitools)
+library(ggpubr)
+library(rstatix)
+library(logistf)
+library(openxlsx)
+library(gridExtra)
+df <- fread(here("data/df_gcgr_variants.csv"))
+```
+
+# 1. Import and filter data
+
+```{r}
+count(df, trunc, cAMP_LoF, G40S, gcgr)
+
+#Specify order of the levels (useful for later plotting)
+df$gcgr <- factor(df$gcgr, c("WT", "G40S 0/1", "G40S 1/1", "cAMP_LoF 0/1", "truncated"))
+
+# Import gcg data
+npx_df <- fread(here("data/olink_10%missing_MinProb_imputed.csv")) # 10% missing samples and proteins were removed before minProb imputation
+gcg <- npx_df[, c("eid", "gcg")]
+df <- merge(df, gcg, by = "eid", all.x = TRUE)
+```
+
+```{r}
+# rename T1D and T2D
+setnames(df, "adj_probposs_t1dm", "Type1Diabetes")
+setnames(df, "adj_probposs_t2dm", "Type2Diabetes")
+
+# Make sure T1D and gestational are removed from controls in T2D
+df$adj_dmstatus_bl <- as.numeric(df$adj_dmstatus_bl)
+df$adj_dmstatus_bl <-
+    factor(df$adj_dmstatus_bl,
+        levels = c(0,1,2,3,4,5),
+        labels = c(
+            "unlikely_diabetes",
+            "poss_gestational",
+            "prob_t1d",
+            "poss_t1d",
+            "prob_t2d",
+            "poss_t2d"))
+df[adj_dmstatus_bl == "poss_gestational" |
+       adj_dmstatus_bl == "prob_t1d" |
+       adj_dmstatus_bl == "poss_t1d",
+   Type2Diabetes := NA] 
+
+df[adj_dmstatus_bl == "poss_gestational" |
+       adj_dmstatus_bl == "prob_t2d" |
+       adj_dmstatus_bl == "poss_t2d",
+   Type1Diabetes := NA]
+
+count(df, adj_dmstatus_bl, Type2Diabetes, Type1Diabetes)
+
+```
+
+Exclude "alcoholics" from PDFF
+```{r}
+# Import alcoholic/masld df and merge
+bs_masld <- fread(here("data/baseline_MASLD.csv"))
+df <- merge(df, bs_masld, by = "eid", all.x = TRUE)
+
+# Exclude "alcoholics" from PDFF
+count(df, alcoholic, !is.na(PDFF))
+df[alcoholic == 1, PDFF := NA]
+```
+
+
+Exclude double mutations (n=3) and rows with NA in all the groups (n=6207)
+```{r}
+df <- df[!(is.na(trunc) & is.na(cAMP_LoF) & is.na(G40S)),]
+
+double_variant <- which(df$cAMP_LoF == 1 & df$G40S == 1) #gives index's of rows with 1 in cAMP and G40S
+df <- df[-double_variant, ]
+```
+
+
+# 2. Linear model with genotype as predictor/independent and Hba1c/BMI/PDFF as outcome
+
+First normalize to SD of each variable
+```{r}
+# string of variables to loop through
+variables <- c("BMI", "Hba1c", "PDFF")
+
+# Calculate SD's
+sd_values <- df[, lapply(.SD, sd, na.rm=TRUE), .SDcols = variables]
+sd_table <- as.data.frame(t(sd_values))
+sd_table$variable <- rownames(sd_table)
+#write.xlsx(sd_table, file=here("data/BMI_hba1c_sd_table.xlsx"))
+
+# Loop through the variables and create new columns
+for(variable in variables) {
+  new_column_name <- paste0(variable, "_SD")
+  df[, (new_column_name) := .SD[[variable]] / sd_values[[variable]]]
+}
+```
+
+Create function to loop over continous variables in linear model, GT as predictor
+```{r function_lm}
+calculate_coefficients <- function(variables, predictor, data) {
+  coef_table <- data.frame()  # Create an empty data frame to store coefficients
+  
+  for (i in variables) {
+    formula_string <- paste(i, "~", predictor, "+age+sex")
+    model <- lm(formula_string, data = data)
+    
+    # Extract coefficients and their standard errors
+    coef_summary <- summary(model)$coefficients
+    
+    # Calculate sample sizes
+    sample_sizes <- data %>%
+      filter(!is.na(.data[[i]] & !is.na(.data[[predictor]]))) %>%
+      group_by(.data[[predictor]]) %>%
+      summarise(sample_size = n()) %>%
+      pull(sample_size)
+    
+    # Create a data frame with the p.values for each of the predictors
+    coef_data <- data.frame(
+      variable = i,
+      sample_size = sample_sizes[2],
+      GCGR = predictor,
+      Estimate = coef_summary[predictor, "Estimate"],
+      SE = coef_summary[predictor, "Std. Error"],
+      P.value_variable = coef_summary[predictor, "Pr(>|t|)"])
+    
+    # Append the data frame to the coefficients table
+    coef_table <- rbind(coef_table, coef_data)
+  }
+  
+  return(coef_table)
+}
+```
+
+
+```{r lm_models}
+# string of variables to loop through (continous)
+variables <- c("BMI_SD", "Hba1c_SD", "PDFF_SD")
+
+coef_table_G40S <- calculate_coefficients(variables, "G40S", df)
+coef_table_cAMP_LoF <- calculate_coefficients(variables, "cAMP_LoF", df)
+coef_table_trunc <- calculate_coefficients(variables, "trunc", df)
+
+combined_coef_table <- rbind(coef_table_G40S, coef_table_cAMP_LoF, coef_table_trunc)
+
+combined_coef_table$GCGR[combined_coef_table$GCGR == "trunc"] <- "frameshift"
+```
+
+Plot with GT split in color
+```{r}
+# Remove the "_SD" suffix on the variables
+  combined_coef_table$variable <- sub("_SD$", "", combined_coef_table$variable)
+
+p <- ggplot(combined_coef_table, aes(x = Estimate, xmin = Estimate - 1.96 * SE, xmax = Estimate + 1.96 * SE, y = variable, color = GCGR)) +
+  geom_point(position = position_dodge(width = 0.8), size=3) +
+  geom_errorbarh(position = position_dodge(width = 0.8), height = 0) +
+  scale_x_continuous() +
+  labs(title = "", x = expression(paste(beta, " in phenotype SD (95% CI)")), y = "") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +  # Add a dashed line at x = 0
+  theme_classic() +
+    theme(legend.position = "left",
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_text(size = 12),
+          axis.text.x = element_text(size = 12)) +
+    guides(color = guide_legend(reverse = TRUE)) # make legend same order as the data
+p
+```
+
+```{r tables_for_figure}
+# Create the first table
+  t1 <- ggplot(data = combined_coef_table) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, label = paste0(round(Estimate, digits = 3))), vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle(expression(beta)) +
+    xlab(" ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+ # Create the second table
+  t2 <- ggplot(data = combined_coef_table) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0("(", round(Estimate - 1.96 * SE, digits = 2), "; ", round(Estimate + 1.96 * SE, digits = 2), ")")), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("95% CI") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+# Create the third table
+  t3 <- ggplot(data = combined_coef_table) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0(round(P.value_variable, digits = 2))), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("p-value") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+  
+  # Create the fourth table
+  t4 <- ggplot(data = combined_coef_table) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0(sample_size)), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("N") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+```
+
+```{r combine_plot}
+# Arrange the plots and tables using grid.arrange
+ combined_plot <- grid.arrange(p, t1, t2, t3, t4, widths = c(6, 1, 2, 1, 1))
+
+```
+
+# 4. Logistic model (Firth correction) with T2D/obesity as outcome, GT as predictor
+Create function to loop over 0/1 variables in logistic model, GT as predictor. Results is OR
+```{r function_glm}
+calculate_coefficients_glm <- function(variables, predictor, data) {
+  coef_table <- data.frame()  # Create an empty data frame to store coefficients
+  
+  for (i in variables) {
+    formula_string <- paste(i, "~", predictor, "+age+sex")
+     model <- logistf(formula_string, data = df)
+  
+  # Extract coefficients and their standard errors
+  coef_summary <- exp(cbind(Odds_Ratio = coef(model), confint(model))) # The coefficients in summary(model) indicate the average change in log odds of disease
+  
+  # Calculate sample sizes
+  sample_sizes <- data %>%
+  filter(!is.na(.data[[i]]) & !is.na(.data[[predictor]])) %>%
+  group_by(.data[[predictor]], .data[[i]]) %>%
+  summarise(sample_size = n()) %>%
+  pull(sample_size)
+
+# Check if the length of sample_sizes is 6
+if (length(sample_sizes) == 6) {
+  # Sum the 4th and 6th values in sample_sizes
+  sample_size_genotype_disease <- sample_sizes[4] + sample_sizes[6]
+} else {
+  # Use the sample size for the genotype with disease as is
+  sample_size_genotype_disease <- sample_sizes[4]
+}
+
+    # Create a data frame with the p.values for each of the predictors
+  coef_data <- data.frame(
+    variable = i,
+    sample_size_cases = sample_size_genotype_disease,
+    GCGR = predictor,
+    Odds_ratio = coef_summary[predictor, "Odds_Ratio"],
+    CI_low = coef_summary[predictor, "Lower 95%"],
+    CI_high = coef_summary[predictor, "Upper 95%"],
+    p = model$prob[predictor])
+  
+  
+    # Append the data frame to the coefficients table
+  coef_table <- rbind(coef_table, coef_data)
+  }
+  
+  return(coef_table)
+}
+
+
+
+```
+
+```{r apply_function}
+variables <- c("Type2Diabetes", "obesity")
+glm_G40S <- calculate_coefficients_glm(variables, "G40S", df)
+
+variables <- c("obesity") # only obesity as too few cases w T2D
+glm_cAMP <- calculate_coefficients_glm(variables, "cAMP_LoF", df)
+glm_trunc <- calculate_coefficients_glm(variables, "trunc", df)
+
+combined_glm_table <- rbind(glm_G40S, glm_cAMP, glm_trunc)
+
+combined_glm_table$GCGR[combined_glm_table$GCGR == "trunc"] <- "frameshift"
+```
+
+Plot with GT split in color
+```{r make_plot}
+p.glm <- ggplot(combined_glm_table, aes(x = Odds_ratio, xmin = CI_low, xmax = CI_high, y = variable, color = GCGR)) +
+  geom_point(position = position_dodge(width = 0.8), size=3) +
+  geom_errorbarh(position = position_dodge(width = 0.8), height = 0) +
+  scale_x_continuous() +
+    #scale_y_discrete(limits = rev(levels(combined_coef_table$variable))) + 
+  labs(title = "", x = "OR (95% CI)", y = "") +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray") +  # Add a dashed line at x = 0
+  theme_classic() +
+    theme(legend.position = "left",
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_text(size = 12),
+          axis.text.x = element_text(size = 12)) +
+    guides(color = guide_legend(reverse = TRUE))
+```
+
+```{r tables_for_figure}
+# Create the first table
+  t1.glm <- ggplot(data = combined_glm_table) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, label = paste0(round(Odds_ratio, digits = 2))), vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("OR") +
+    xlab(" ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+ # Create the second table
+  t2.glm <- ggplot(data = combined_glm_table) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0("(", round(CI_low, digits = 2), "; ", round(CI_high, digits = 2), ")")), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("95% CI") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+  # Create the third table
+  t3.glm <- ggplot(data = combined_glm_table) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0(round(p, digits = 2))), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("p-value") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+  
+# Create the fourth table
+  t4.glm <- ggplot(data = combined_glm_table) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0(sample_size_cases)), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("N") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+```
+
+```{r combine_plot}
+# Arrange the plots and tables using grid.arrange
+ combined_plot.glm <- grid.arrange(p.glm, t1.glm, t2.glm, t3.glm, t4.glm, widths = c(8, 1, 2, 1,1))
+
+```
+
+
+
+# 5. Linear model with gcg as outcome, GT as predictor
+Update function calculate_coefficints to include BMI
+```{r function_lm}
+calculate_coefficients <- function(variables, predictor, data) {
+  coef_table <- data.frame()  # Create an empty data frame to store coefficients
+  
+  for (i in variables) {
+    formula_string <- paste(i, "~", predictor, "+age+sex+BMI+fasting_time+pCreatinine")
+    model <- lm(formula_string, data = data)
+    
+    # Extract coefficients and their standard errors
+    coef_summary <- summary(model)$coefficients
+    
+    # Calculate sample sizes
+    sample_sizes <- data %>%
+      filter(!is.na(.data[[i]] & !is.na(.data[[predictor]]))) %>%
+      group_by(.data[[predictor]]) %>%
+      summarise(sample_size = n()) %>%
+      pull(sample_size)
+    
+    # Create a data frame with the p.values for each of the predictors
+    coef_data <- data.frame(
+      variable = i,
+      sample_size = sample_sizes[2],
+      GCGR = predictor,
+      Estimate = coef_summary[predictor, "Estimate"],
+      SE = coef_summary[predictor, "Std. Error"],
+      P.value_variable = coef_summary[predictor, "Pr(>|t|)"])
+    
+    # Append the data frame to the coefficients table
+    coef_table <- rbind(coef_table, coef_data)
+  }
+  
+  return(coef_table)
+}
+```
+
+
+```{r}
+coef_table_gcg_G40S <- calculate_coefficients("gcg", "G40S", df)
+coef_table_gcg_cAMP <- calculate_coefficients("gcg", "cAMP_LoF", df)
+coef_table_gcg_trunc <- calculate_coefficients("gcg", "trunc", df)
+
+combined_coef_table_gcg <- rbind(coef_table_gcg_G40S, coef_table_gcg_cAMP, coef_table_gcg_trunc)
+
+combined_coef_table_gcg$GCGR[combined_coef_table_gcg$GCGR == "trunc"] <- "frameshift"
+```
+
+Plot with GT split in color
+```{r}
+p_gcg <- ggplot(combined_coef_table_gcg, aes(x = Estimate, xmin = Estimate - 1.96 * SE, xmax = Estimate + 1.96 * SE, y = variable, color = GCGR)) +
+  geom_point(position = position_dodge(width = 0.8), size=3) +
+  geom_errorbarh(position = position_dodge(width = 0.8), height = 0) +
+      scale_x_continuous() +
+    xlim(-1.5, 2) +
+     labs(title = "", x = expression(paste(beta, " (95% CI)")), y = "") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +  # Add a dashed line at x = 0
+  theme_classic() +
+    theme(legend.position = "left",
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_text(size = 12),
+          axis.text.x = element_text(size = 12)) +
+    guides(color = guide_legend(reverse = TRUE))
+
+```
+
+
+```{r tables_for_figure}
+# Create the first table
+  t1_gcg <- ggplot(data = combined_coef_table_gcg) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, label = paste0(round(Estimate, digits = 3))), vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle(expression(beta)) +
+    xlab(" ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+ # Create the second table
+  t2_gcg <- ggplot(data = combined_coef_table_gcg) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0("(", round(Estimate - 1.96 * SE, digits = 2), "; ", round(Estimate + 1.96 * SE, digits = 2), ")")), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("95% CI") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+# Create the third table
+  t3_gcg <- ggplot(data = combined_coef_table_gcg) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0(round(P.value_variable, digits = 2))), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("p-value") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+  
+  # Create the fourth table
+  t4_gcg <- ggplot(data = combined_coef_table_gcg) +
+    geom_text(aes(y = variable, x = 1, group = GCGR, 
+                  label = paste0(sample_size)), 
+              vjust = 0,
+              position = position_dodge(width = 0.8)) +
+    ggtitle("N") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+```
+
+
+```{r combine_plot}
+# Arrange the plots and tables using grid.arrange
+ combined_plot <- grid.arrange(p_gcg, t1_gcg, t2_gcg, t3_gcg, t4_gcg, widths = c(6, 1, 2, 1, 1))
+
+```
+
+
+
+
+
+

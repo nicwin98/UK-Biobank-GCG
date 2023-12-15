@@ -1,0 +1,175 @@
+---
+title: "obesity/NAFLD"
+author: "MWS"
+date: "2023-09-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(MatchIt)
+library(here)
+library(epitools)
+library(ggpubr)
+library(rstatix)
+library(logistf)
+library(openxlsx)
+df <- fread(here("data/df_gcgr_variants.csv"))
+```
+
+# 1. Import and filter data
+
+```{r}
+count(df, trunc, cAMP_LoF, G40S, gcgr)
+
+```
+
+```{r}
+# rename T1D and T2D
+setnames(df, "adj_probposs_t1dm", "Type1Diabetes")
+setnames(df, "adj_probposs_t2dm", "Type2Diabetes")
+
+# Make sure T1D and gestational are removed from controls in T2D
+df$adj_dmstatus_bl <- as.numeric(df$adj_dmstatus_bl)
+df$adj_dmstatus_bl <-
+    factor(df$adj_dmstatus_bl,
+        levels = c(0,1,2,3,4,5),
+        labels = c(
+            "unlikely_diabetes",
+            "poss_gestational",
+            "prob_t1d",
+            "poss_t1d",
+            "prob_t2d",
+            "poss_t2d"))
+df[adj_dmstatus_bl == "poss_gestational" |
+       adj_dmstatus_bl == "prob_t1d" |
+       adj_dmstatus_bl == "poss_t1d",
+   Type2Diabetes := NA] 
+
+df[adj_dmstatus_bl == "poss_gestational" |
+       adj_dmstatus_bl == "prob_t2d" |
+       adj_dmstatus_bl == "poss_t2d",
+   Type1Diabetes := NA]
+
+count(df, adj_dmstatus_bl, Type2Diabetes, Type1Diabetes)
+
+```
+
+Exclude double mutations (n=3) and rows with NA in all the groups (n=6207)
+```{r}
+df <- df[!(is.na(trunc) & is.na(cAMP_LoF) & is.na(G40S)),]
+
+double_variant <- which(df$cAMP_LoF == 1 & df$G40S == 1) #gives index's of rows with 1 in cAMP and G40S
+df <- df[-double_variant, ]
+```
+
+# 2. Linear model with genotype as predictor/independent for amino acids 
+
+First normalize to each amino acid's SD
+```{r}
+# string of variables to loop through
+variables <- c("alanine", "glutamine", "glycine", "histidine", "isoleucine", "leucine", "valine", "phenylalanine", "tyrosine", "sumAA")
+
+# Calculate SD's
+sd_values <- df[, lapply(.SD, sd, na.rm=TRUE), .SDcols = variables]
+sd_table <- as.data.frame(t(sd_values))
+sd_table$AA <- rownames(sd_table)
+write.xlsx(sd_table, file=here("data/aa_sd_table.xlsx"))
+
+# Loop through the variables and create new columns
+for(variable in variables) {
+  new_column_name <- paste0(variable, "_SD")
+  df[, (new_column_name) := .SD[[variable]] / sd_values[[variable]]]
+}
+
+# Update string of variables to loop through
+variables <- c("alanine_SD", "glutamine_SD", "glycine_SD", "histidine_SD", "isoleucine_SD", "leucine_SD", "valine_SD", "phenylalanine_SD", "tyrosine_SD", "sumAA_SD")
+```
+
+Create function to loop over variables in a linear model with list of AA and gcgr variants as inputs
+```{r coef-table-function}
+calculate_coefficients <- function(variables, predictor, data) {
+  coef_table <- data.frame()  # Create an empty data frame to store coefficients
+  
+  for (i in variables) {
+    formula_string <- paste(i, "~", predictor, "+age+sex+BMI+fasting_time")
+    model <- lm(formula_string, data = data)
+    
+    # Extract coefficients and their standard errors
+    coef_summary <- summary(model)$coefficients
+    
+    # Calculate sample sizes
+    sample_sizes <- data %>%
+      filter(!is.na(.data[[i]] & !is.na(.data[[predictor]]))) %>%
+      group_by(.data[[predictor]]) %>%
+      summarise(sample_size = n()) %>%
+      pull(sample_size)
+    
+    # Create a data frame with the p.values for each of the predictors
+    coef_data <- data.frame(
+      variable = i,
+      sample_size = sample_sizes[2],
+      Predictor = predictor,
+      Estimate = coef_summary[predictor, "Estimate"],
+      SE = coef_summary[predictor, "Std. Error"],
+      P.value_variable = coef_summary[predictor, "Pr(>|t|)"])
+    
+    # Append the data frame to the coefficients table
+    coef_table <- rbind(coef_table, coef_data)
+  }
+  
+  return(coef_table)
+}
+```
+
+Apply function
+```{r}
+coef_table_cAMP_LoF <- calculate_coefficients(variables, "cAMP_LoF", df)
+
+coef_table_G40S <- calculate_coefficients(variables, "G40S", df)
+
+coef_table_trunc <- calculate_coefficients(variables, "trunc", df)
+```
+
+# 3. Make table of AA for each genotype
+
+```{r}
+prepare_table <- function(coef_table) {
+  # Remove the "_SD" suffix on the variables
+  coef_table$variable <- sub("_SD$", "", coef_table$variable)
+  
+  # Create CI column and round off p.val and estimate
+  coef_table$CI <- paste0("(", round(coef_table$Estimate - 1.96 * coef_table$SE, digits = 2), "; ", round(coef_table$Estimate + 1.96 * coef_table$SE, digits = 2), ")")
+  
+  coef_table$Estimate <- round(coef_table$Estimate, digits = 4)
+  coef_table$P.value_variable <- round(coef_table$P.value_variable, digits = 2)
+  
+  
+  # Select and rename cols
+  coef_table <- select(coef_table, 
+                       AA = variable, 
+                       β = Estimate,
+                       CI,
+                       "p-value" = P.value_variable,
+                       N = sample_size)
+
+  
+  return(coef_table)
+}
+```
+
+
+```{r apply_function_and_save_tables}
+G40S_aa_table <- prepare_table(coef_table_G40S)
+write.xlsx(G40S_aa_table, file=here("data/G40S_aa.xlsx"))
+
+cAMP_aa_table <- prepare_table(coef_table_cAMP_LoF)
+write.xlsx(cAMP_aa_table, file=here("data/cAMP_aa.xlsx"))
+
+Trunc_aa_table <- prepare_table(coef_table_trunc)
+write.xlsx(Trunc_aa_table, file=here("data/trunc_aa.xlsx"))
+
+```

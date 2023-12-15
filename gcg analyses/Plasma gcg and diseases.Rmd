@@ -1,0 +1,605 @@
+---
+title: "Plasma gcg"
+author: "MWS"
+date: "2023-10-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(here)
+library(limma)
+library(tidyverse)
+library(ggrepel)
+library(kableExtra)
+library(knitr)
+library(ggpubr)
+library(rstatix)
+library(gridExtra)
+```
+
+## 1. Load data
+```{r}
+# Read olink protein expression dataframe
+
+npx_df <- fread(here("data/olink_10%missing_MinProb_imputed.csv")) # 10% missing samples and proteins were removed before minProb imputation
+#dim(npx_df2)
+```
+
+
+```{r}
+gcg <- npx_df[, c("eid", "gcg")]
+
+# Read the phenotype dataframe
+pheno_df = fread(here("data-raw/df_gcgr_variants.csv"))
+
+# Read baseline MASLD dataframe
+MASLD_df <- fread(here("data/baseline_MASLD.csv"))
+MASLD_df$MASLD_bs <- as.factor(MASLD_df$MASLD_bs) #MASLD: ICD10+PDFF+alcohol, MASLD_bs: PDFF+alcohol
+MASLD_df$MASLD_bs <- factor(MASLD_df$MASLD_bs, levels = c(0,1), labels = c("No", "Yes"))
+```
+
+## 2. Merge and prepare data
+```{r}
+df <- merge(gcg, pheno_df, by = "eid")
+df <- merge(df, MASLD_df, by = "eid")
+
+# include G40S homozygot in the hetrozygot group
+df[G40S == 2, G40S := 1]
+
+# Copy percent_liver_fat to %liver_fat
+df$percent_liver_fat <- df$PDFF
+```
+
+```{r}
+# Make BMI and percent_liver_fat dichotomized
+df[BMI <= 25, BMI_dic := "No"]
+df[BMI >= 30, BMI_dic := "Yes"]
+```
+
+```{r}
+# rename T1D and T2D
+setnames(df, "adj_probposs_t1dm", "Type1Diabetes")
+setnames(df, "adj_probposs_t2dm", "Type2Diabetes")
+
+# Make sure T1D and gestational are removed from controls in T2D
+df$adj_dmstatus_bl <- as.numeric(df$adj_dmstatus_bl)
+df$adj_dmstatus_bl <-
+    factor(df$adj_dmstatus_bl,
+        levels = c(0,1,2,3,4,5),
+        labels = c(
+            "unlikely_diabetes",
+            "poss_gestational",
+            "prob_t1d",
+            "poss_t1d",
+            "prob_t2d",
+            "poss_t2d"))
+df[adj_dmstatus_bl == "poss_gestational" |
+       adj_dmstatus_bl == "prob_t1d" |
+       adj_dmstatus_bl == "poss_t1d",
+   Type2Diabetes := NA] 
+
+df[adj_dmstatus_bl == "poss_gestational" |
+       adj_dmstatus_bl == "prob_t2d" |
+       adj_dmstatus_bl == "poss_t2d",
+   Type1Diabetes := NA]
+
+count(df, adj_dmstatus_bl, Type2Diabetes, Type1Diabetes)
+
+df$T2D <- factor(df$Type2Diabetes, levels = c(0,1), labels = c("No", "Yes"))
+```
+
+
+Log2 Fold change
+```{r}
+mean_BMI <- df[, list(mean=mean(gcg)), by=BMI_dic][!is.na(BMI_dic)]
+paste("gcg fold change for BMI is", mean_BMI$mean[2]-mean_BMI$mean[1])
+
+mean_MASLD <- df[, list(mean=mean(gcg)), by=MASLD_bs][!is.na(MASLD_bs)]
+paste("gcg fold change for MASLD is", mean_MASLD$mean[2]-mean_MASLD$mean[1])
+
+mean_t2d <- df[, list(mean=mean(gcg)), by=T2D]
+paste("gcg fold change for T2D is", mean_t2d$mean[2]-mean_t2d$mean[1])
+```
+
+## 3. Simple boxplots of gcg and BMI, diabetes, MASLD
+
+```{r gcg~BMI, warning=FALSE}
+df_BMI <- df %>% filter(!is.na(BMI_dic)) 
+
+# sample size 
+sample_size <- df_BMI %>% 
+  group_by(BMI_dic) %>% 
+  summarise(num = n())
+
+df_BMI <- df_BMI %>% 
+    left_join(sample_size) %>% 
+    mutate(xaxis = paste0(BMI_dic, "\n", "n=", num))
+
+t_test_BMI <- t_test(gcg ~ BMI_dic, data = df_BMI) %>%
+    add_significance() %>%
+    add_xy_position(x = "BMI_dic")
+
+boxplot_BMI <- ggboxplot(
+    data = df_BMI,
+    x = "xaxis",
+    y = "gcg",
+    #outlier.shape = NA,
+    fill = "BMI_dic",
+    xlab = "Obesity",
+    ylab = "Plasma gcg (npx)",
+    ylim = c(-6, 8),
+    legend.position = "none",
+        axis.title.y = element_text(size = 10)
+      ) +
+      stat_pvalue_manual(data = t_test_BMI, label = "p.signif") +
+    theme(legend.position = "none")+ #removes legend
+    scale_fill_manual(values = c("white", "grey"))
+```
+
+```{r gcg~T2D}
+df_T2D <- df %>% filter(!is.na(T2D))
+
+# sample size 
+sample_size = df_T2D %>% group_by(T2D) %>%  summarise(num=n())
+df_T2D <- df_T2D %>% 
+    left_join(sample_size) %>% 
+    mutate(xaxis = paste0(T2D, "\n", "n=", num))
+
+
+t_test_T2D <- t_test(gcg ~ T2D, data = df_T2D) %>%
+    add_significance() %>%
+    add_xy_position(x = "T2D")
+
+boxplot_T2D <- ggboxplot(
+    data = df_T2D,
+    x = "xaxis",
+    y = "gcg",
+    #outlier.shape = NA,
+    fill = "T2D",
+    xlab = "Type 2 diabetes",
+    ylab = "Plasma gcg (npx)",
+    ylim = c(-6, 8),
+    legend.position = "none",
+        axis.title.y = element_text(size = 14)
+      ) +
+      stat_pvalue_manual(data = t_test_T2D, label = "p.signif") +
+    theme(legend.position = "none")+ #removes legend
+    scale_fill_manual(values = c("white", "grey"))
+
+```
+
+```{r gcg~MASLD}
+df_MASLD <- df %>% filter(!is.na(MASLD_bs))
+
+# sample size 
+sample_size = df_MASLD %>% group_by(MASLD_bs) %>%  summarise(num=n())
+df_MASLD <- df_MASLD %>% 
+    left_join(sample_size) %>% 
+    mutate(xaxis = paste0(MASLD_bs, "\n", "n=", num))
+
+t_test_MASLD <- t_test(gcg ~ MASLD_bs, data = df_MASLD) %>%
+    add_significance() %>%
+    add_xy_position(x = "MASLD_bs")
+
+boxplot_MASLD <- ggboxplot(
+    data = df_MASLD,
+    x = "xaxis",
+    y = "gcg",
+    #outlier.shape = NA,
+    fill = "MASLD_bs",
+    xlab = "MASLD",
+    ylim = c(-6, 8),
+    ylab = "Plasma gcg (npx)",
+    legend.position = "none",
+        axis.title.y = element_text(size = 14)
+      ) +
+      stat_pvalue_manual(data = t_test_MASLD, label = "p.signif") +
+    theme(legend.position = "none")+ #removes legend
+    scale_fill_manual(values = c("white", "grey"))
+
+```
+
+
+## 4. Linear models adjusted for each of the other variables
+```{r}
+# Remove "alcoholics" from percent_liver_fat column
+df[alcoholic == 1, percent_liver_fat := NA]
+```
+
+```{r}
+# Adjust x-axis for BMI and PDFF for a better plot: effect of an increase of 5 of BMI/PDFF on plasma gcg
+df$BMI_5units <- df$BMI/5
+df$liver_fat_5units <- df$percent_liver_fat/5
+```
+
+###  4.1 BMI, T2D, PDFF
+```{r Create_function_3_variables_adjust_for_each_other}
+multiple_lm_threeVariables_adjust_each_other <- function(data, variable1, variable2, variable3) {
+  # Convert data.table to data frame
+  data_df <- as.data.frame(data)
+
+  # Exclude rows with missing data in any of the specified variables
+  data_df <- na.omit(data_df[, c("gcg", variable1, "age", "sex", "fasting_time", "pCreatinine", variable2, variable3)])
+  
+  # Count number of individuals included in the models
+  n_individuals <- nrow(data_df)
+  
+  # Create the formula with variable names
+  formula1 <- as.formula(paste("gcg ~", variable1, "+ age + sex + fasting_time + pCreatinine"))
+  formula2 <- as.formula(paste("gcg ~", variable1, "+ age + sex + fasting_time + pCreatinine +", variable2))
+  formula3 <- as.formula(paste("gcg ~", variable1, "+ age + sex + fasting_time + pCreatinine +", variable3))
+  formula4 <- as.formula(paste("gcg ~", variable1, "+ age + sex + fasting_time + pCreatinine +", variable2, "+", variable3))
+
+  # Model 1
+  model1 <- lm(formula1, data = data_df)
+  
+  # Model 2
+  model2 <- lm(formula2, data = data_df)
+  
+  # Model 3
+  model3 <- lm(formula3, data = data_df)
+  
+  # Model 4
+  model4 <- lm(formula4, data = data_df)
+  
+  # Extract estimates and p-values for 'variable1'
+  results <- data.frame(
+    Predictor = variable1,
+    Model = c("Model 1", "Model 2", "Model 3", "Model 4"),
+    Model1_additions = c("", variable2, variable3, paste(variable2, "+", variable3)),
+    Estimate = c(coef(model1)[variable1], coef(model2)[variable1], coef(model3)[variable1], coef(model4)[variable1]),
+    SE = c(summary(model1)$coef[variable1, "Std. Error"], summary(model2)$coef[variable1, "Std. Error"], 
+                summary(model3)$coef[variable1, "Std. Error"], summary(model4)$coef[variable1, "Std. Error"]),
+    P_Value = c(summary(model1)$coef[variable1, "Pr(>|t|)"], summary(model2)$coef[variable1, "Pr(>|t|)"], 
+                summary(model3)$coef[variable1, "Pr(>|t|)"], summary(model4)$coef[variable1, "Pr(>|t|)"]),
+    N_individuals <- n_individuals
+  )
+  
+ 
+  return(results)
+}
+```
+
+```{r apply function 3 variables}
+results_BMI_5units <- multiple_lm_threeVariables_adjust_each_other(df, "BMI_5units", "Type2Diabetes", "liver_fat_5units")
+results_T2D <- multiple_lm_threeVariables_adjust_each_other(df, "Type2Diabetes", "BMI_5units", "liver_fat_5units")
+results_liver_fat_5units <- multiple_lm_threeVariables_adjust_each_other(df, "liver_fat_5units", "BMI_5units", "Type2Diabetes")
+results_combined <- rbind(results_BMI_5units, results_T2D, results_liver_fat_5units)
+results_combined$Adj.p.val <- p.adjust(results_combined$P_Value, method = "fdr")
+
+# # Make variable by merging Predictor + model + model.additions
+setDT(results_combined)
+results_combined[Model %in% c("Model 2", "Model 3", "Model 4"), 
+                  Variable := paste0(Predictor, ": ", Model, " = Model 1 + ", Model1_additions)]
+results_combined[Model %in% "Model 1", Variable := paste0(Predictor, ":", Model)]
+
+# Rename BMI_5units to BMI and liver_fat_5units to liver_fat
+  results_combined$Variable <- gsub("BMI_5units", "BMI", results_combined$Variable)
+  results_combined$Variable <- gsub("liver_fat_5units", "Liver fat", results_combined$Variable)
+  results_combined$Variable <- gsub("Type2Diabetes", "T2D", results_combined$Variable)
+  
+  results_combined$Predictor <- gsub("BMI_5units", "BMI", results_combined$Predictor)
+  results_combined$Predictor <- gsub("liver_fat_5units", "Liver fat", results_combined$Predictor)
+  results_combined$Predictor <- gsub("Type2Diabetes", "T2D", results_combined$Predictor)
+
+  # Specify order in plot:
+results_combined$Variable <- factor(results_combined$Variable, levels = rev(results_combined$Variable))
+
+
+
+```
+
+### 4.2 BMI, T2D
+```{r Create_function_2_variables_adjust_for_each_other}
+multiple_lm_twoVariables_adjust_each_other <- function(data, variable1, variable2) {
+  # Convert data.table to data frame
+  data_df <- as.data.frame(data)
+
+  # Exclude rows with missing data in any of the specified variables
+  data_df <- na.omit(data_df[, c("gcg", variable1, "age", "sex", "fasting_time", "pCreatinine", variable2)])
+  
+  # Count number of individuals included in the models
+  n_individuals <- nrow(data_df)
+  
+  # Create the formula with variable names
+  formula1 <- as.formula(paste("gcg ~", variable1, "+ age + sex + fasting_time + pCreatinine"))
+  formula2 <- as.formula(paste("gcg ~", variable1, "+ age + sex + fasting_time + pCreatinine +", variable2))
+  
+  # Model 1
+  model1 <- lm(formula1, data = data_df)
+  
+  # Model 2
+  model2 <- lm(formula2, data = data_df)
+  
+   # Extract estimates and p-values for 'variable1'
+  results <- data.frame(
+    Predictor = variable1,
+    Model = c("Model 1", "Model 2"),
+    Model1_additions = c("", variable2),
+    Estimate = c(coef(model1)[variable1], coef(model2)[variable1]),
+    SE = c(summary(model1)$coef[variable1, "Std. Error"], summary(model2)$coef[variable1, "Std. Error"]),
+    P_Value = c(summary(model1)$coef[variable1, "Pr(>|t|)"], summary(model2)$coef[variable1, "Pr(>|t|)"]),
+    N_individuals <- n_individuals
+  )
+  
+  return(results)
+}
+```
+
+```{r apply function 2 variables}
+results_BMI_5units <- multiple_lm_twoVariables_adjust_each_other(df, "BMI_5units", "Type2Diabetes")
+results_T2D <- multiple_lm_twoVariables_adjust_each_other(df, "Type2Diabetes", "BMI_5units")
+
+results_combined2 <- rbind(results_BMI_5units, results_T2D)
+results_combined2$Adj.p.val <- p.adjust(results_combined2$P_Value, method = "fdr")
+
+# Make variable by merging Predictor + model + model.additions
+setDT(results_combined2)
+results_combined2[Model %in% "Model 2", Variable := paste0(Predictor, ":", Model, " = Model 1 + ", Model1_additions)]
+results_combined2[Model %in% "Model 1", Variable := paste0(Predictor, ":", Model)]
+
+#Rename BMI_5units to BMI and liver_fat_5units to liver_fat
+  results_combined2$Variable <- gsub("BMI_5units", "BMI", results_combined2$Variable)
+  results_combined2$Variable <- gsub("liver_fat_5units", "Liver fat", results_combined2$Variable)
+  results_combined2$Variable <- gsub("Type2Diabetes", "T2D", results_combined2$Variable)
+  
+  results_combined2$Predictor <- gsub("BMI_5units", "BMI", results_combined2$Predictor)
+  results_combined2$Predictor <- gsub("liver_fat_5units", "Liver fat", results_combined2$Predictor)
+  results_combined2$Predictor <- gsub("Type2Diabetes", "T2D", results_combined2$Predictor)
+  
+# Specify order in plot:
+results_combined2$Variable <- factor(results_combined2$Variable, levels = rev(results_combined2$Variable))
+
+relocate(results_combined2, Variable, .before = )
+```
+
+
+## 5.  Forest plots 
+```{r plot-function}
+generate_forest_plot <- function(coef_table, N) {
+  
+   # Create the forest plot
+  p <- ggplot(coef_table, aes(x = Estimate, xmin = Estimate - 1.96 * SE, xmax = Estimate + 1.96 * SE, 
+                              y = Variable)) + 
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    geom_errorbarh(position = position_dodge(width = 0.5), height = 0) +
+    scale_x_continuous() +
+    labs(x = paste0("Change in plasma pro-glucagon per increment (95% CI) \n N = ", N), y = "") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+    theme_classic() +
+    theme(legend.position = "none",
+        strip.placement = "outside",  # Place the strip labels outside the plot
+        strip.background = element_blank(),  # Remove strip background
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        strip.text.y.left = element_text(face = "bold", angle = 0, size = 11)) +  # Set angle to 0 for horizontal text
+    facet_grid(Predictor ~ ., scales = "free", space = "free", switch = "y") +
+  theme(plot.margin = margin(l = 30))  # Adjust left margin to create space for strip labels)
+
+  # Create the first table
+  t1 <- ggplot(data = coef_table) +
+    geom_text(aes(y = Variable, x = 1, label = paste0(round(Estimate, digits = 2))), vjust = 0) +
+    ggtitle(expression(beta)) +
+    xlab(" ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+  # Create the second table
+  t2 <- ggplot(data = coef_table) +
+    geom_text(aes(y = Variable, x = 1, label = paste0("(", round(Estimate - 1.96 * SE, digits = 2), "; ", round(Estimate + 1.96 * SE, digits = 2), ")")), vjust = 0) +
+    ggtitle("95% CI") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+  # Create the third table
+  t3 <- ggplot(data = coef_table) +
+    geom_text(aes(y = Variable, x = 1, label = signif(Adj.p.val, digits = 2)), vjust = 0) +
+    ggtitle("p-value") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+  # Arrange the plots and tables using grid.arrange
+  combined_plot <- grid.arrange(p, t1, t2, t3, widths = c(15, 1, 2, 2))
+  
+  return(combined_plot)
+}
+
+```
+
+```{r}
+p1 <- generate_forest_plot(results_combined, "2,857")
+
+```
+
+```{r}
+p2 <- generate_forest_plot(results_combined2, "37,979")
+
+```
+
+########################################################################################################################
+
+## 6. Linear models strata on genotype (functions)
+First we look at the effect of gcg on diseases seperately for the three genotypes
+```{r create_function_strata_dic}
+calculate_interaction_coefficients_glm <- function(data, genotype, outcome) {
+ 
+  # Filter out missing values for genotype and outcome
+  df_filtered <- data %>%
+    filter(!is.na({{genotype}}), !is.na(.data[[outcome]]))
+
+  # Calculate the sample size for each level of genotype and disease
+  sample_sizes <- df_filtered %>%
+    group_by({{genotype}}, .data[[outcome]]) %>%
+    summarise(sample_size = n())
+
+  # Perform the glm model separately for each level of genotype
+  models <- df_filtered %>%
+    group_by({{genotype}}) %>%
+    do(model = glm(paste({{outcome}}, "~ gcg+age+sex+BMI+fasting_time+pCreatinine"), data = ., family = "binomial")) %>%
+    pull(model)
+
+  # Summarize the models and extract coefficients with SE
+  coef_summaries <- lapply(models, function(model) {
+    coef_summary <- summary(model)$coefficients
+    data.frame(
+      Estimate = coef_summary["gcg", "Estimate"],
+      SE = coef_summary["gcg", "Std. Error"],
+      P.value = coef_summary["gcg", "Pr(>|z|)"]
+    )
+  })
+
+  # Calculate 95% CI from SE
+  coef_summaries <- lapply(coef_summaries, function(coef_summary) {
+    coef_summary$CI <- paste0(
+      "(", round(coef_summary$Estimate - 1.96 * coef_summary$SE, 2),
+      ", ", round(coef_summary$Estimate + 1.96 * coef_summary$SE, 2), ")"
+    )
+    return(coef_summary)
+  })
+
+  # Combine the coefficient summaries with sample sizes
+  coef_table <- data.frame(
+    variable = outcome,
+    sample_size_wt_ctr = sample_sizes$sample_size[1],
+    sample_size_wt_disease = sample_sizes$sample_size[2],
+    sample_size_genotype_ctr = sample_sizes$sample_size[3],
+    sample_size_genotype_disease = sample_sizes$sample_size[4],
+    Estimate_wt = coef_summaries[[1]]$Estimate,
+    CI_wt = coef_summaries[[1]]$CI,
+    P.value_wt = coef_summaries[[1]]$P.value,
+    Estimate_genotype = coef_summaries[[2]]$Estimate,
+    CI_genotype = coef_summaries[[2]]$CI,
+    P.value_genotype = coef_summaries[[2]]$P.value
+  )
+
+  return(coef_table)
+}
+
+```
+
+```{r create_function_strata_con}
+calculate_interaction_coefficients_lm <- function(data, genotype, outcome) {
+
+  
+  # Filter out missing values for genotype and the variable of interest
+  df_filtered <- data %>%
+    filter(!is.na({{genotype}}), !is.na(.data[[outcome]]))
+
+  # Calculate the sample size for each level of genotype
+  sample_sizes <- df_filtered %>%
+    group_by({{genotype}}) %>%
+    summarise(sample_size = n())
+
+  # Perform the linear regression model separately for each level of genotype
+  models <- df_filtered %>%
+    group_by({{genotype}}) %>%
+    do(model = lm(paste(outcome, "~ gcg+age+sex+Type2Diabetes+fasting_time+pCreatinine"), data = .)) %>%
+    pull(model)
+
+  # Summarize the models and extract coefficients
+  coef_summaries <- lapply(models, function(model) {
+    coef_summary <- summary(model)$coefficients
+    ci <- confint(model)["gcg", ]
+    data.frame(
+      Estimate = coef_summary["gcg", "Estimate"],
+      CI = paste0("(", round(ci[1], 2), ", ", round(ci[2], 2), ")"),
+      P.value = coef_summary["gcg", "Pr(>|t|)"]
+    )
+  })
+
+  # Combine the coefficient summaries with sample sizes
+  coef_sum_df <- data.frame(
+    variable = outcome,
+    sample_size_wt_ctr = sample_sizes$sample_size[1],
+    sample_size_wt_disease = NA,
+    sample_size_genotype_ctr = sample_sizes$sample_size[2],
+    sample_size_genotype_disease = NA,
+    Estimate_wt = coef_summaries[[1]]$Estimate,
+    CI_wt = coef_summaries[[1]]$CI,
+    P.value_wt = coef_summaries[[1]]$P.value,
+    Estimate_genotype = coef_summaries[[2]]$Estimate,
+    CI_genotype = coef_summaries[[2]]$CI,
+    P.value_genotype = coef_summaries[[2]]$P.value
+  )
+
+  return(coef_sum_df)
+}
+```
+
+
+```{r}
+# Apply the two functions
+gcg_gcgr_interaction_cAMP <- calculate_interaction_coefficients_glm(df, cAMP_LoF, "Type2Diabetes")
+gcg_gcgr_interaction_trunc <- calculate_interaction_coefficients_glm(df, trunc, "Type2Diabetes")
+gcg_gcgr_interaction_G40S <- calculate_interaction_coefficients_glm(df, G40S, "Type2Diabetes")
+
+gcg_gcgr_interaction_cAMP2 <- calculate_interaction_coefficients_lm(df, cAMP_LoF, "BMI")
+gcg_gcgr_interaction_trunc2 <- calculate_interaction_coefficients_lm(df, trunc, "BMI")
+gcg_gcgr_interaction_G40S2 <- calculate_interaction_coefficients_lm(df, G40S, "BMI")
+
+gcg_gcgr_interaction_cAMP <- rbind(gcg_gcgr_interaction_cAMP, gcg_gcgr_interaction_cAMP2)
+gcg_gcgr_interaction_trunc <- rbind(gcg_gcgr_interaction_trunc, gcg_gcgr_interaction_trunc2)
+gcg_gcgr_interaction_G40S <- rbind(gcg_gcgr_interaction_G40S, gcg_gcgr_interaction_G40S2)
+```
+
+#############################################################################################################
+
+## 7. Test for interaction between gcg and GCGR on phenotype
+The p-value for this analysis show whether the effect for gcg in a specific genotype vs. ctr (above in 6.) is significantly different. 
+```{r}
+# cAMP - t2d
+summary(glm(Type2Diabetes ~ gcg*cAMP_LoF+age+sex+BMI+fasting_time+pCreatinine, data = df, family = "binomial"))
+ # gcg:cAMP_LoF P = 0.8
+
+# cAMP - BMI
+summary(lm(BMI ~ gcg*cAMP_LoF+age+sex+BMI+fasting_time+pCreatinine, data = df))
+ # gcg:cAMP_LoF P = 0.1
+
+# =========================================
+
+# trunc - t2d
+summary(glm(Type2Diabetes ~ gcg*trunc+age+sex+BMI+fasting_time+pCreatinine, data = df, family = "binomial"))
+ # gcg:trunc P = 0.99
+# trunc - BMI
+summary(lm(BMI ~ gcg*trunc+age+sex+BMI+fasting_time+pCreatinine, data = df))
+ # gcg:trunc P = 0.4
+
+# ========================================
+
+# G40S - t2d
+summary(glm(Type2Diabetes ~ gcg*G40S+age+sex+BMI+fasting_time+pCreatinine, data = df, family = "binomial"))
+ # gcg:G40S P = 0.07.
+
+# G40S - BMI
+summary(lm(BMI ~ gcg*G40S+age+sex+BMI+fasting_time+pCreatinine, data = df))
+ # gcg:G40S P = 0.01*
+```
+
+

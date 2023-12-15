@@ -1,0 +1,280 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(MatchIt)
+library(here)
+library(epitools)
+library(knitr)
+library(openxlsx)
+```
+
+## 1. Import UKB dataset, remove withdrawals, clean up
+
+```{r}
+df <- fread(here("data-raw/ukb_all_datasets.csv"))
+
+withdrawals <- read_csv(here("data-raw/your_withdrawal_file.txt"), col_names = "eid", col_types = "c")
+withdrawals$eid <- as.numeric(withdrawals$eid) # was integer. eid in gcgr_wide is characters
+
+df <- anti_join(df, withdrawals, by = "eid")
+```
+
+Make sex from female/male to 0/1
+```{r}
+setnames(df, "sex_f31_0_0", "sex")
+df[sex == "Female", sex := 0]
+df[sex == "Male", sex := 1]
+```
+
+Rename age, BMI, and caucassian
+```{r}
+setnames(df, "body_mass_index_bmi_f21001_0_0", "BMI")
+setnames(df, "age_when_attended_assessment_centre_f21003_0_0", "age")
+setnames(df, "genetic_ethnic_grouping_f22006_0_0", "caucasian")
+setnames(df, "waist_circumference_f48_0_0", "waist_circumfrence")
+setnames(df, "proton_density_fat_fraction_pdff_f40061_2_0", "PDFF")
+
+```
+
+## 2. import dataset with missense variants
+Create wide format dataframe with one missense variant per col
+```{r}
+gcgr <- read.csv(here("data/extract_getotypes_fullgene_SNPs.csv"))
+head(gcgr, 10)
+
+### Transform data to wide format
+gcgr_wide <- spread(gcgr, key=Protein_change, value =GT)
+setDT(gcgr_wide) # make data.table again
+
+#Set 0/1 to 1, and 1/1 to 2
+gcgr_wide[gcgr_wide == "0/1", ] <- 1
+gcgr_wide[gcgr_wide == "1/1", ] <- 2
+
+# Export gcgr_wide as a datafrme 
+fwrite(gcgr_wide, here("data/gcgr_wide.csv"))
+```
+
+## 3. Import dataset with the column "variant_type". 0: non-coding, 1: truncated, 2: missense
+remove dublicate rows, so each eid only has one row. We want to keep the highest number (ie if both 0 and 2, we mark this person as 2 (=missense))
+
+```{r}
+variants <- fread(here("data/extract_getotypes_fullgene_filtered_varianttype.csv"))
+head(variants)
+
+variants[, c("Protein_change", "GT") := NULL] #remove because this will be merged from the gcgr_wide dataframe
+
+variants <- variants[, .SD[which.max(abs(variant_type))], by=eid] #retains the row with the highest absolute value in the variant_type column.
+```
+
+## 4. Merge main UKB dataset with GCGR variants
+```{r}
+df2 <- merge(gcgr_wide, df, by="eid", all.y = TRUE) #merge by eid, and keep all rows from df with the all.y argument
+
+df2 <- merge(df2, variants, by="eid", all.x = TRUE) #merge by eid, and keep all rows from df with the all.x argument
+df2 <- relocate(df2, variant_type, .after = eid)
+
+head(df2[,1:15], 10)
+```
+
+In the columns contained in gcgr_variants, set NA to 0 for "variant_type" = 0 or NA (wt eller intron variant eller lig.). 
+Dvs. de personer der er NA (svarende til "variant_type" 1 og 2) er ikke kontroller i diverse tests.
+```{r}
+gcgr_variants <- colnames(gcgr_wide)[-1]
+df2 <- df2[, (gcgr_variants) := lapply(.SD, function(x) ifelse((variant_type == "0" | is.na(variant_type)) & is.na(x), 0, x)), .SDcols = gcgr_variants]
+```
+
+Make columns with gcgr_variables numeric
+```{r}
+df2[, (gcgr_variants) := lapply(.SD, as.numeric),
+    .SDcols = gcgr_variants] # gcgr variant columns from character to numeric
+```
+
+
+## Exclusion criteria
+
+Exclude non-white participants 
+```{r}
+count(df2, caucasian)
+df2 <- df2[caucasian==1,] #1 = caucasian
+```
+
+Exclude individuals with sex chromosome aneuploidy
+```{r}
+count(df2, sex_chromosome_aneuploidy_f22019_0_0, sex) # for sjov, se hvordan de fordeler sig ml mænd og kvinder
+df2 <- df2[is.na(sex_chromosome_aneuploidy_f22019_0_0),]
+```
+
+Remove columns of variants with only NA (this occured after the above filtering)
+```{r}
+df3 <- df2[, (gcgr_variants) := lapply(.SD, function(x) if (all(x == 0 | is.na(x))) NULL else x), .SDcols = gcgr_variants]
+```
+
+
+update the string gcgr_variants:
+```{r}
+which(colnames(df3)=="sex") # = 279, meaning that columns 2:278 are variants
+gcgr_variants <- colnames(df3)[3:278]
+```
+
+Count number of individuals in each genotype. Save as table-
+
+```{r}
+# #create subset of data.table only containing cols with gcgr_variant defined above
+# df_variants <- df3[, ..gcgr_variants]
+# counts_list <- lapply(df_variants, table)
+# 
+# counts_dt <- data.table(
+#   GCGR_variant = names(counts_list),
+#   `0/0` = sapply(counts_list, function(x) x[1]),
+#   `0/1` = sapply(counts_list, function(x) x[2]),
+#   `1/1` = sapply(counts_list, function(x) x[3])
+# )
+# 
+# # Print the resulting counts data.table
+# print(counts_dt)
+# 
+# fwrite(counts_dt, here("data/count_gcgr_variants.txt"))
+
+
+```
+
+### Create column with cAMP LoF variants
+Individuals with NA in all those columns should remain NA, as these are non-wt
+WT controls are defined as either 0 or NA in "variant_type" (in the script "Annotate_fullgene_gcgr_variant calling transform")
+```{r}
+cAMP_lof_variants <- c("V368M", "R378C", "R225H", "R308W", "D63N")
+
+df3[, cAMP_LoF := apply(.SD, 1, function(row) {
+  if (any(row == 1, na.rm=T)) {
+    return(1)
+  } else if (any(row == 0, na.rm=T)) {
+    return(0)
+    } else {
+    return(NA)
+  }
+}), .SDcols = cAMP_lof_variants] #.SDcols defines which cols are included
+
+df3$cAMP_LoF <- as.factor(df3$cAMP_LoF) 
+```
+
+
+### Create column with truncated variants
+Individuals with variant_type=2 should be NA (the missense variants)
+```{r}
+df3[variant_type == 1, trunc := 1]
+df3[variant_type == 0 | is.na(variant_type), trunc := 0]
+df3[variant_type == 2, trunc := NA]
+
+df3$trunc <- as.factor(df3$trunc)
+count(df3, trunc)
+```
+
+### G40S 
+```{r}
+df3$G40S <- as.factor(df3$G40S)
+count(df3, trunc, cAMP_LoF, G40S)
+
+```
+
+
+
+### Create column with type of receptor
+Create column gcgr 
+```{r}
+df3[variant_type == 0 | is.na(variant_type), gcgr := "WT"]
+df3[G40S == 1, gcgr := "G40S 0/1"]
+df3[G40S == 2, gcgr := "G40S 1/1"]
+df3[cAMP_LoF == 1, gcgr := "cAMP_LoF 0/1"]
+df3[trunc == 1, gcgr := "truncated"]
+
+#Specify order of the levels (useful for later plotting)
+df3$gcgr <- factor(df3$gcgr, c("WT", "G40S 0/1", "G40S 1/1", "cAMP_LoF 0/1", "truncated"))
+
+count(df3, trunc, cAMP_LoF, G40S, gcgr)
+count(df3, gcgr)
+```
+
+Export df3 (used to create tables of individual genetic variants, paper figure 2)
+```{r}
+fwrite(df3, file=here("data/data_with_genetic_variants.csv"))
+```
+
+
+### Create data.table to export for further analyses
+df with selected columns by name
+```{r}
+df4 <- df3[, .(
+    eid,
+    variant_type,
+    age,
+    sex,
+    BMI,
+    PDFF,
+    waist_circumfrence,
+    Hba1c = glycated_haemoglobin_hba1c_f30750_0_0,
+    glucose = glucose_f30740_0_0,
+    pLDL = ldl_direct_f30780_0_0,
+    HDL_chol  = hdl_cholesterol_f30760_0_0,
+    TG = triglycerides_f30870_0_0,
+    adj_probposs_t1dm,
+    adj_probposs_t2dm,
+    uSodium = sodium_in_urine_f30530_0_0,
+    uPotassium = potassium_in_urine_f30520_0_0,
+    uAlbumin = microalbumin_in_urine_f30500_0_0,
+    uCreatinine = creatinine_enzymatic_in_urine_f30510_0_0,
+    pCreatinine = creatinine_f30700_0_0,
+    diastolic_bp = diastolic_blood_pressure_automated_reading_f4079_0_0,
+    systolic_bp = systolic_blood_pressure_automated_reading_f4080_0_0,
+    ALT = alanine_aminotransferase_f30620_0_0,
+    AST = aspartate_aminotransferase_f30650_0_0,
+    alanine = alanine_f23460_0_0,
+    glutamine = glutamine_f23461_0_0,
+    glycine = glycine_f23462_0_0,
+    histidine = histidine_f23463_0_0,
+    isoleucine = isoleucine_f23465_0_0,
+    leucine = leucine_f23466_0_0,
+    valine = valine_f23467_0_0,
+    phenylalanine = phenylalanine_f23468_0_0,
+    tyrosine = tyrosine_f23469_0_0,
+    fasting_time = fasting_time_f74_0_0 #mangler plasma potassium 
+)]
+
+df4[, sumAA := alanine+glutamine+glycine+histidine+isoleucine+leucine+valine+phenylalanine+tyrosine]
+
+```
+
+df with first 10 principal components
+```{r}
+df_PC <-
+    df3[, .SD, .SDcols = paste0("genetic_principal_components_f22009_0_", 1:10), by = eid]
+
+
+colnames(df_PC)[-1] <-
+    gsub("genetic_principal_components_f22009_0",
+         "",
+         colnames(df_PC)[-1]) #removes all of column name except _1:_10
+
+colnames(df_PC)[-1] <- paste("PC", colnames(df_PC)[-1], sep="") #adds a prefix (PC) to each column name after the eid column 
+colnames(df_PC)
+```
+
+df with eid + gcgr_variants
+```{r}
+df_variants <- df3[, .SD, .SDcols = c("eid", gcgr_variants, "Chrom_pos_ref_alt", "cAMP_LoF", "trunc", "gcgr")]
+
+```
+
+Merge all data.tables and export
+```{r}
+df4 <- merge(df4, df_variants, by="eid", all.y = TRUE) #merge by eid, and keep all rows from df with the all.y argument
+df4 <- merge(df4, df_PC, by = "eid", all.y = TRUE)
+
+head(df4)
+
+fwrite(df4, file=here("data/df_gcgr_variants.csv"), row.names = FALSE)
+```
+
+

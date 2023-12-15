@@ -1,0 +1,517 @@
+---
+title: "Cox analysis gcg t2d"
+author: "MWS"
+date: "2023-11-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(here)
+library(tidyverse)
+library(zoo)
+library(survival)
+library(survminer)
+library(Hmisc)
+library(gridExtra)
+library(openxlsx)
+source(here("R/functions.R"))
+```
+
+## 1. Import data and rename variables
+
+```{r}
+# Read the phenotype dataframe
+df = fread("~/Gcgr_variants/data-raw/ukb_all_datasets.csv")
+
+# Remove withdrawals
+withdrawals <- fread(here("data-raw/xxx.txt"))
+df <- df[!df$eid %in% withdrawals$V1,]
+
+# Remove outdated collumns for dates for E11 and E14 diagnoses - these were downloaded from DNA nexus seperately as they were not in the original UKB data basket that was updated 1st oct 2023
+df[, date_e11_first_reported_noninsulindependent_diabetes_mellitus_f130708_0_0 := NULL]
+df[, date_e14_first_reported_unspecified_diabetes_mellitus_f130714_0_0 := NULL]
+
+# Import updated columns for date for E11 and E14.
+# (downloaded 15.11.23)
+dates <- fread(here("data/updated_t2d_dates.csv"), na.strings = c("", "NA")) 
+setnames(dates, "Participant ID", "eid")
+df <- merge(df, dates, by = "eid", all.x = TRUE)
+```
+
+Calculate time between enrolment visit (visit0) and imaging visit (visit2) - used in article discussion
+```{r}
+time_to_visit2 <- as.yearmon(df$date_of_attending_assessment_centre_f53_2_0) - as.yearmon(df$date_of_attending_assessment_centre_f53_0_0)
+
+median(time_to_visit2, na.rm = TRUE)
+
+head(df$date_of_attending_assessment_centre_f53_2_0, 20)
+head(df$date_of_attending_assessment_centre_f53_0_0, 20)
+```
+
+
+Create new dataset with only individuals that have olink data 
+```{r}
+npx_df <- fread(here("data/olink_10%missing_MinProb_imputed.csv")) # 10% missing samples and proteins were removed before minProb imputation
+
+gcg <- npx_df[, c("eid", "gcg")]
+
+#default for all = FALSE, i.e. remove rows that do not match on eid
+df2 <- merge(df, gcg, by = "eid")
+```
+
+
+```{r}
+# Change col names to shorter name
+setnames(df2, "age_when_attended_assessment_centre_f21003_0_0", "age")
+setnames(df2, "sex_f31_0_0", "sex")
+setnames(df2, "fasting_time_f74_0_0", "fasting_time")
+setnames(df2, "body_mass_index_bmi_f21001_0_0", "BMI")
+setnames(df2, "glycated_haemoglobin_hba1c_f30750_0_0", "hba1c")
+setnames(df2, "Date E11 first reported (non-insulin-dependent diabetes mellitus)", "date_e11_rep")
+setnames(df2, "Date E14 first reported (unspecified diabetes mellitus)", "date_e14_rep")
+
+
+```
+
+```{r}
+
+# For data downloaded from DNA nexus: "Code has event date matching participant's date of birth"
+df2[date_e11_rep == "Code has event date matching participant's date of birth", date_e11_rep := NA]
+df2$date_e11_rep <- as.IDate(df2$date_e11_rep) # was character string before because of the "matching date of birth"
+
+```
+
+```{r}
+# Make categorical value for BMI
+df2[BMI < 25, BMI_cat := "Normal"] # Underweight not included as there is only 1 female t2d case
+df2[BMI >=25 & BMI < 30, BMI_cat := "Overweight"]
+df2[BMI >= 30, BMI_cat := "Obese"]
+df2[is.na(BMI), BMI_cat := NA]
+
+df2$BMI_cat <- factor(df2$BMI_cat)
+
+df2 %>% group_by(BMI_cat) %>%  summarise(mean(BMI, na.rm = TRUE), n())
+```
+
+## 2. Define T2D by ICD10
+
+To calculate indicent T2D, we will use ICD codes that are updated continously (Set date and import fresh data from DNA nexus). Baseline T2D (Eastwood algorithm) is subtracted. 
+
+```{r}
+# T2D = E11 + E14
+df2 <- find_ICD10_filter(df2, c("E11", "E14"), "T2D")
+
+# T1D = E10
+df2 <- find_ICD10_filter(df2, "E10", "T1D")
+
+count(df2, T1D, T2D) # T2D = 3143
+# Approx. 3/4 with T1D also have a code for T2D. 
+
+df2[T1D == 1 & T2D == 1, T2D := 0]
+count(df2, T2D) # T2D = 2816
+```
+
+
+## 4. Incident T2D, time to event
+
+Exclude individuals with Eastwood algrithm for basleine T2D
+```{r}
+count(df2, T2D, adj_probposs_t2dm)
+df2[T2D == 1 & adj_probposs_t2dm == 1, T2D := 0]
+count(df2, T2D)
+```
+
+
+Find date for ICD10 code, calculate incident t2d
+```{r}
+# Merge the date columns and keep the earliest date of the two if both E11 and E14 are present
+df3 <- df2 %>% 
+   mutate(t2d_date = pmin(date_e11_rep, date_e14_rep))
+df3[is.na(date_e11_rep), t2d_date := date_e14_rep]
+df3[is.na(date_e14_rep), t2d_date := date_e11_rep]
+
+# Create column of incident t2d 
+df3[, incident_t2d := 0]
+df3[T2D == 1 & t2d_date > date_of_attending_assessment_centre_f53_0_0, incident_t2d := 1]
+count(df3, incident_t2d)
+```
+
+Exclude individuals with baseline HbA1c above 48 mmol/mol
+```{r}
+df3[hba1c > 48, incident_t2d := 0]
+count(df3, incident_t2d)
+```
+
+Calculate time to event
+```{r}
+# set end date (when UKB data was last updated)
+end_date <- as.Date("2021-10-03")
+
+# Time til death (censored observations), units = months/years
+df3$time_to_death <-
+    as.numeric(as.yearmon(df3$date_of_death_f40000_0_0) - as.yearmon(df3$date_of_attending_assessment_centre_f53_0_0))
+
+# Time to lost to follow-up (censored observations), units = months/years
+df3$time_to_lost_to_followup <-
+    as.numeric(as.yearmon(df3$date_lost_to_followup_f191_0_0) - as.yearmon(df3$date_of_attending_assessment_centre_f53_0_0))
+
+# Time till t2d diagnosis, units = months/years, was defined above (for histogram)
+# Remove diagnosis before baseline
+df3[incident_t2d == 0, time_to_t2d := NA] 
+count(df3, incident_t2d)
+
+# Time from inclusion
+df3$time_from_inclusion <- 
+     as.numeric(as.yearmon(end_date) - as.yearmon(df3$date_of_attending_assessment_centre_f53_0_0))
+
+# Median follow up time:
+median(df3$time_from_inclusion) # 14.75
+
+# Time to event. Event can be either death, lost to follow-up, or t2d diagnosis, or if NA in these, end_date
+df3[incident_t2d == 1, time_to_event := time_to_t2d]
+df3[incident_t2d == 0 & is.numeric(time_to_death), time_to_event := time_to_death]
+df3[is.na(time_to_event) & incident_t2d == 0 & is.numeric(time_to_lost_to_followup), time_to_event := time_to_lost_to_followup]
+df3[is.na(time_to_event), time_to_event := time_from_inclusion]
+
+
+head(df3[, c("eid", "time_to_event", "date_of_death_f40000_0_0", "date_of_attending_assessment_centre_f53_0_0", "time_to_death", "t2d_date", "time_to_t2d", "incident_t2d")], 10)
+
+df4 <- df3[, c("eid", "age", "sex", "BMI", "BMI_cat", "gcg", "time_to_event", "date_of_death_f40000_0_0", "date_of_attending_assessment_centre_f53_0_0", "time_from_inclusion", "time_to_death", "t2d_date", "time_to_t2d", "incident_t2d", "time_to_lost_to_followup")]
+count(df3, incident_t2d)
+```
+
+```{r}
+fwrite(df4, file = here("data/data_for_survival_analysis.csv"))
+```
+
+
+## 5. Cox analysis
+### 5.1 All individuals
+
+```{r}
+df3 <- fread(here("data/data_for_survival_analysis.csv"))
+
+df3[is.na(BMI), BMI_cat := NA] #otherwise it is just empty
+df3$BMI_cat <- factor(df3$BMI_cat)
+levels(df3$BMI_cat)
+
+df3$age_5 <- df3$age/5
+```
+
+Remove incident cases within first 6 months after enrolment (=prevalent cases), and adjust baseline date by 6 months ( = subtract 0.5 years from time_to_event)
+
+```{r}
+# T2D diagnosis within the first 6 months after enrollment (diagnosis bias?)
+df4 <- df3[!is.na(sex) & !is.na(BMI) & !is.na(age) & !is.na(gcg)]
+df4[time_to_t2d < 0.5, incident_t2d := 0]
+df4$time_to_event_adj <- df4$time_to_event-0.5
+```
+
+Create function to check linearity
+```{r}
+check_linearity = function(df, model, continuous_variable) {
+
+  # Calculate martingale residuals
+  mart_resid <- residuals(model, type = "martingale")
+
+  # Plot MR vs. gcg
+  plot(df[[continuous_variable]], mart_resid, xlab = paste(continuous_variable), ylab = "Martingale Residuals", main = paste("Martingale Residuals vs.", continuous_variable))
+
+  # Add a smooth curve to visualize trends
+  smoothed_line <- loess(mart_resid ~ df[[continuous_variable]])
+  lines(df[[continuous_variable]], fitted(smoothed_line), col = "red")
+
+   #Add a horizontal reference line at 0
+  abline(h = 0, lty = 2)
+}
+```
+
+## Cox models
+
+Model 1
+Kun age + sex
+```{r}
+model1 <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5+sex, data = df4)
+summary(model1)
+cox.zph(model1)
+```
+
+Model 2
+Age + sex + BMI continous
+```{r}
+model2 <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5+sex+BMI, data = df4)
+summary(model2)
+cox.zph(model2)
+```
+
+
+Model 3
+Both sexes, split on BMI in categories
+```{r}
+df_normal <- df4[BMI_cat == "Normal",]
+df_overweight <- df4[BMI_cat == "Overweight",]
+df_obese <- df4[BMI_cat == "Obese",]
+
+model_normal <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5+sex, data=df_normal)
+summary(model_normal)
+cox.zph(model_normal)
+#check_linearity(df_normal, model_normal, "gcg")
+#check_linearity(df_normal, model_normal, "age")
+
+model_overweight <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5+sex, data=df_overweight)
+summary(model_overweight)
+cox.zph(model_overweight)
+#check_linearity(df_overweight, model_overweight, "gcg")
+#check_linearity(df_overweight, model_overweight, "age")
+
+model_obese <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5+sex, data=df_obese)
+summary(model_obese)
+cox.zph(model_obese)
+#check_linearity(df_obese, model_obese, "gcg")
+#check_linearity(df_obese, model_obese, "age")
+
+```
+
+
+Model 4
+Split on sex
+```{r}
+df_male <- df4[sex == "Male", ]
+df_female <- df4[sex == "Female",]
+
+model_male <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5+BMI_cat, data=df_male)
+summary(model_male)
+cox.zph(model_male)
+
+
+model_female <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5+BMI_cat, data=df_female)
+summary(model_female)
+cox.zph(model_female)
+
+model_male2 <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5, data=df_male)
+summary(model_male2)
+cox.zph(model_male2)
+
+
+model_female2 <- coxph(Surv(time_to_event_adj, incident_t2d) ~ gcg+age_5, data=df_female)
+summary(model_female2)
+cox.zph(model_female2)
+```
+
+
+
+Create function to create a table 
+```{r}
+cox_summary_table <- function(cox_model) {
+  # Extract summary information
+  summary_table <- summary(cox_model)
+
+  # Extract coefficients and confidence intervals
+  coefficients <- summary_table$coefficients[1, , drop = FALSE] # [1] because we only want to keep gcg which is the first covariate in he function
+  ci <- confint(cox_model)[1, , drop = FALSE]
+  
+   # Extract number of events
+  num_events <- summary_table$nevent
+
+  # Create a data frame for the table
+  result_table <- data.frame(
+    BMI_group = deparse(substitute(cox_model)),  # Name of the cox_model, deparse(substitute(cox_model)) is used to obtain the name of the model as a string.
+    covariate = rownames(coefficients), 
+    HR = exp(coefficients[, "coef"]),
+    lower_ci = exp(ci[, 1]),
+    upper_ci = exp(ci[, 2]),
+    p_value = coefficients[, "Pr(>|z|)"],
+    num_events = num_events
+  )
+
+  # Replace variable names with more descriptive labels
+  result_table$covariate <- gsub("sexMale", "sex (male)", result_table$covariate)
+  result_table$covariate <- gsub("age_5", "age (5y)", result_table$covariate)
+
+  # Round numeric values to 2 decimals
+  result_table[, c("HR", "lower_ci", "upper_ci")] <- 
+    round(result_table[, c("HR", "lower_ci", "upper_ci")], 2)
+
+  # Format p-value in scientific notation with 2 decimal places
+  result_table$p_value <- format(result_table$p_value, scientific = TRUE, digits = 2)
+
+  return(result_table)
+}
+```
+
+create coefficient table
+```{r}
+# Create table for plotting
+result_table_normal <- cox_summary_table(model_normal)
+
+result_table_overweight <- cox_summary_table(model_overweight)
+
+result_table_obese <- cox_summary_table(model_obese)
+
+combined_table <- rbind(result_table_normal, result_table_overweight, result_table_obese)
+
+# change BMI group names
+combined_table$BMI_group <- sub("model_normal", "BMI < 25", combined_table$BMI_group)
+combined_table$BMI_group <- sub("model_overweight", "25 > BMI < 30", combined_table$BMI_group)
+combined_table$BMI_group <- sub("model_obese", "BMI > 30", combined_table$BMI_group)
+combined_table$BMI_group <- factor(combined_table$BMI_group, levels = c("BMI < 25", "25 > BMI < 30", "BMI > 30"))
+
+write.xlsx(combined_table, file=here("data/cox_table_for_forestplot_BMIgroups.xlsx"))
+
+```
+
+Create forest plot
+```{r}
+p <- ggplot(combined_table, aes(x = HR, xmin = lower_ci, xmax = upper_ci, y = BMI_group)) +
+  geom_point(position = position_dodge(width = 0.5), size=3) +
+  geom_errorbarh(position = position_dodge(width = 0.5), height = 0) +
+  scale_x_continuous(limits = c(0.9, 1.3)) + 
+  labs(title = "", x = "HR (95% CI)", y = "") +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray") +  # Add a dashed line at x = 0
+  theme_classic() +
+    theme(legend.position = "left",
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_text(size = 12),
+          axis.text.x = element_text(size = 12))
+
+
+p
+```
+
+```{r tables_for_figure}
+# Create the first table
+  t1 <- ggplot(data = combined_table) +
+    geom_text(aes(y = BMI_group, x = 1, label = HR), vjust = 0) +
+    ggtitle("HR") +
+    xlab(" ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+ # Create the second table
+  t2 <- ggplot(data = combined_table) +
+    geom_text(aes(y = BMI_group, x = 1, 
+                  label = paste0("(", lower_ci, "; ", upper_ci, ")")), 
+              vjust = 0,
+              position = position_dodge(width = 0.5)) +
+    ggtitle("95% CI") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+# Create the third table
+  t3 <- ggplot(data = combined_table) +
+    geom_text(aes(y = BMI_group, x = 1, 
+                  label = paste0(p_value)), 
+              vjust = 0,
+              position = position_dodge(width = 0.5)) +
+    ggtitle("p-value") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+  
+  # Create the fourth table
+  t4 <- ggplot(data = combined_table) +
+    geom_text(aes(y = BMI_group, x = 1, 
+                  label = paste0(num_events)), 
+              vjust = 0,
+              position = position_dodge(width = 0.5)) +
+    ggtitle("N cases") +
+    xlab("  ") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.line = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(color = "white"),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+```
+
+```{r combine_plot}
+# Arrange the plots and tables using grid.arrange
+ combined_plot <- grid.arrange(p, t1, t2, t3, t4, widths = c(7, 1, 1.5, 1, 1))
+
+```
+
+
+
+
+## 6. Kaplan-Meier plot
+First create tertiles
+```{r}
+df4 <- fread(here("data/data_for_survival_analysis.csv"))
+df4[time_to_t2d < 0.5, incident_t2d := 0]
+
+df4$gcg_tertiles <- cut(df4$gcg, breaks = quantile(df4$gcg, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE), labels = c("Tertile 1", "Tertile 2", "Tertile 3"))
+relocate(df4, "gcg_tertiles", .after = "gcg")
+
+df4 %>% group_by(gcg_tertiles) %>% summarise(mean = mean(gcg), n = n())
+
+df4$gcg_quantiles <- cut(df4$gcg, breaks = quantile(df4$gcg, probs = c(0, 1/4, 2/4, 3/4, 1), na.rm = TRUE), labels = c("Quantile 1", "Quantile 2", "Quantile 3", "Quantile4"))
+relocate(df4, "gcg_quantiles", .after = "gcg")
+
+df4 %>% group_by(gcg_quantiles) %>% summarise(mean = mean(gcg), n = n())
+
+```
+
+```{r tertiles}
+df4$sex <- factor(df4$sex, levels = c("Female", "Male"))
+
+# Fit the survival model with 'gcg_tertiles'
+fit <- survfit(Surv(time_to_event, incident_t2d) ~ gcg_tertiles, data = df4)
+
+# Log-rank test overall
+survdiff(Surv(time_to_event, incident_t2d) ~ gcg_tertiles, data = df4) #overall: significantly different, P<2e-16
+
+# Pairwise log-rank tests with Bonferroni correction
+pairwise_survdiff(Surv(time_to_event, incident_t2d) ~ gcg_tertiles, data = df4)
+```
+
+
+```{r tertiles}
+
+# plot for both sexes
+km_plot <- ggsurvplot(
+    fit,
+    df4,
+    conf.int = TRUE,
+    palette = "jco",
+    ylim = c(0, 0.1),
+    xlim = c(0, 17),
+    ylab = "Risk of T2D",
+    xlab = "Time (years)",
+    censor = FALSE,
+    legend.title = "Gcg tertile:  ",
+    legend.labs = c("Low", "Medium", "High"),
+    fun = "event" # Specify the function to plot the cumulative incidence
+)
+
+km_plot
+
+```
+
